@@ -1,8 +1,6 @@
 # DiscordFix
 
-Простой PowerShell-установщик для запуска Discord через отдельный Pesherkino proxy.
-
-Скрипт автоматически находит установленный Discord, закрывает его перед изменением файлов, скачивает актуальный релиз Discord Drover, устанавливает нужные файлы и создаёт `drover.ini` с настройкой Pesherkino proxy.
+Скрипт автоматически находит установленный Discord, закрывает его перед изменением файлов, скачивает актуальный релиз Discord Drover, устанавливает нужные файлы и создаёт `drover.ini`.
 
 ## Быстрый запуск
 
@@ -19,22 +17,14 @@ iex (irm 'https://raw.githubusercontent.com/Muhendalf-ru/DiscordFix/main/Pesherk
 - Автоматическое закрытие запущенного Discord перед установкой и Repair.
 - Установка и переустановка Discord Drover.
 - Проверка актуального релиза и SHA-256, если digest опубликован GitHub.
-- Проверка реального HTTP CONNECT до Discord через Pesherkino proxy.
+- Проверка реального HTTP CONNECT до Discord через proxy.
 - Проверка, что посторонние сайты через proxy заблокированы.
-- Удаление установленной конфигурации Pesherkino Discord.
 
 ## Совместимость
 
 - Не используйте одновременно с Zapret.
 - Не используйте одновременно с VPN в TUN-режиме.
 - Скрипт не меняет системный proxy Windows.
-
-## Pesherkino VPN
-
-- Бот: [@pesherkino_bot](https://t.me/pesherkino_bot)
-- Новости: [t.me/pesherkinonews](https://t.me/pesherkinonews)
-- Поддержка: [@pesherkino_support](https://t.me/pesherkino_support)
-- Сайт: [cabinet.netherus.com](https://cabinet.netherus.com)
 
 ## Благодарность Discord Drover
 
@@ -46,4 +36,4 @@ iex (irm 'https://raw.githubusercontent.com/Muhendalf-ru/DiscordFix/main/Pesherk
 
 **[hdrover/discord-drover](https://github.com/hdrover/discord-drover)**
 
-`DiscordFix` не является заменой Discord Drover: PowerShell-скрипт автоматизирует его загрузку, установку, переустановку и настройку для инфраструктуры Pesherkino. Файлы Discord Drover загружаются из официальных релизов оригинального репозитория.
+`DiscordFix` не является заменой Discord Drover. Файлы Discord Drover загружаются из официальных релизов оригинального репозитория.
