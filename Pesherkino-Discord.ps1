@@ -5,6 +5,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+try {
+    [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    $OutputEncoding = [Console]::OutputEncoding
+} catch {}
 try { $Host.UI.RawUI.WindowTitle = "Pesherkino Discord" } catch {}
 
 $ProxyHost = "dearly.netherus.com"
@@ -21,26 +25,15 @@ function Write-C {
 
 function Show-Header {
     Clear-Host
-    Write-C "============================================================" Cyan
-    Write-C "                  PESHERKINO DISCORD" Cyan
-    Write-C "============================================================" Cyan
-    Write-Host ""
-    Write-C "Discord через отдельный Pesherkino proxy" White
-    Write-Host ""
-    Write-C "ВАЖНО:" Yellow
-    Write-C "  • Не работает совместно с Zapret." Yellow
-    Write-C "  • Не используйте одновременно с VPN в TUN-режиме." Yellow
-    Write-C "  • Это не системный VPN и не меняет proxy Windows." DarkGray
-    Write-Host ""
-    Write-C "------------------------------------------------------------" DarkGray
-    Write-C "Pesherkino VPN" Cyan
-    Write-C "Полноценный VPN для всего устройства — до 10 устройств." White
-    Write-Host ""
-    Write-C "  Бот:       @pesherkino_bot" White
-    Write-C "  Новости:   t.me/pesherkinonews" White
-    Write-C "  Поддержка: @pesherkino_support" White
-    Write-C "  Сайт:      cabinet.netherus.com" White
-    Write-C "------------------------------------------------------------" DarkGray
+    $w = 64
+
+    Write-C ("╭" + ("─" * ($w + 2)) + "╮") DarkCyan
+    Write-C ("│ " + ("PESHERKINO DISCORD".PadLeft([int](($w + 18) / 2))).PadRight($w) + " │") Cyan
+    Write-C ("│ " + ("Discord Fix".PadLeft([int](($w + 11) / 2))).PadRight($w) + " │") White
+    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
+    Write-C ("│ " + "Discord через отдельный Pesherkino proxy".PadRight($w) + " │") White
+    Write-C ("│ " + "Не используйте одновременно с Zapret или VPN в TUN-режиме.".PadRight($w) + " │") Yellow
+    Write-C ("╰" + ("─" * ($w + 2)) + "╯") DarkCyan
     Write-Host ""
 }
 
@@ -605,23 +598,280 @@ function Show-Status {
     }
 }
 
-function Show-Menu {
+function Get-MenuSnapshot {
+    $dirs = @(Get-DiscordDirs)
+
+    $discordFound = ($dirs.Count -gt 0)
+    $droverState = "NOT INSTALLED"
+    $droverColor = [ConsoleColor]::DarkGray
+
+    if ($discordFound) {
+        $states = @()
+        foreach ($dir in $dirs) {
+            $states += (Get-DroverState -Dir $dir)
+        }
+
+        if ($states -contains "Pesherkino") {
+            $droverState = "INSTALLED"
+            $droverColor = [ConsoleColor]::Green
+        }
+        elseif (($states -contains "PesherkinoPartial") -or ($states -contains "Partial")) {
+            $droverState = "REPAIR NEEDED"
+            $droverColor = [ConsoleColor]::Yellow
+        }
+        elseif ($states -contains "OtherDrover") {
+            $droverState = "OTHER DROVER"
+            $droverColor = [ConsoleColor]::Yellow
+        }
+    }
+
+    $discordTest = Test-ProxyConnect -TargetHost "discord.com" -TargetPort 443
+    $blockedTest = $null
+
+    if ($discordTest.Success) {
+        $blockedTest = Test-ProxyConnect -TargetHost "example.com" -TargetPort 443
+    }
+
+    $proxyState = "OFFLINE"
+    $proxyColor = [ConsoleColor]::Red
+
+    if ($discordTest.Success) {
+        if ($blockedTest -and $blockedTest.Success) {
+            $proxyState = "UNSAFE"
+            $proxyColor = [ConsoleColor]::Yellow
+        }
+        else {
+            $proxyState = "ONLINE"
+            $proxyColor = [ConsoleColor]::Green
+        }
+    }
+
+    return [pscustomobject]@{
+        ProxyState   = $proxyState
+        ProxyColor   = $proxyColor
+        DiscordState = if ($discordFound) { "FOUND (" + $dirs.Count + ")" } else { "NOT FOUND" }
+        DiscordColor = if ($discordFound) { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
+        DroverState  = $droverState
+        DroverColor  = $droverColor
+    }
+}
+
+function Center-TuiText {
+    param(
+        [string]$Text,
+        [int]$Width
+    )
+
+    if ($null -eq $Text) { $Text = "" }
+    if ($Text.Length -ge $Width) { return $Text.Substring(0,$Width) }
+
+    $left = [int][Math]::Floor(($Width - $Text.Length) / 2)
+    return ((" " * $left) + $Text).PadRight($Width)
+}
+
+function Write-TuiLine {
+    param(
+        [string]$Text = "",
+        [ConsoleColor]$Color = [ConsoleColor]::Gray,
+        [int]$Width = 64
+    )
+
+    if ($null -eq $Text) { $Text = "" }
+    if ($Text.Length -gt $Width) {
+        $Text = $Text.Substring(0,$Width)
+    }
+
+    Write-Host "│ " -NoNewline -ForegroundColor DarkCyan
+    Write-Host $Text.PadRight($Width) -NoNewline -ForegroundColor $Color
+    Write-Host " │" -ForegroundColor DarkCyan
+}
+
+function Write-TuiStatus {
+    param(
+        [string]$Name,
+        [string]$Value,
+        [ConsoleColor]$ValueColor,
+        [int]$Width = 64
+    )
+
+    $prefix = ("  " + $Name).PadRight(14)
+    $valueText = "● " + $Value
+    $remaining = $Width - $prefix.Length
+
+    if ($valueText.Length -gt $remaining) {
+        $valueText = $valueText.Substring(0,$remaining)
+    }
+
+    Write-Host "│ " -NoNewline -ForegroundColor DarkCyan
+    Write-Host $prefix -NoNewline -ForegroundColor DarkGray
+    Write-Host $valueText.PadRight($remaining) -NoNewline -ForegroundColor $ValueColor
+    Write-Host " │" -ForegroundColor DarkCyan
+}
+
+function Write-TuiOption {
+    param(
+        [string]$Label,
+        [bool]$Selected,
+        [int]$Width = 64
+    )
+
+    $text = if ($Selected) { "  ▶  " + $Label } else { "     " + $Label }
+
+    if ($text.Length -gt $Width) {
+        $text = $text.Substring(0,$Width)
+    }
+
+    Write-Host "│ " -NoNewline -ForegroundColor DarkCyan
+
+    if ($Selected) {
+        Write-Host $text.PadRight($Width) -NoNewline -ForegroundColor White -BackgroundColor DarkCyan
+    }
+    else {
+        Write-Host $text.PadRight($Width) -NoNewline -ForegroundColor Gray
+    }
+
+    Write-Host " │" -ForegroundColor DarkCyan
+}
+
+function Draw-MainMenu {
+    param(
+        [int]$Selected,
+        [object]$Snapshot
+    )
+
+    $w = 64
+    $items = @(
+        "Установить / обновить",
+        "Repair / переустановить Drover",
+        "Статус и диагностика",
+        "Удалить Pesherkino Discord",
+        "Выход"
+    )
+
+    Clear-Host
+
+    Write-C ("╭" + ("─" * ($w + 2)) + "╮") DarkCyan
+    Write-TuiLine -Text (Center-TuiText -Text "PESHERKINO" -Width $w) -Color Cyan -Width $w
+    Write-TuiLine -Text (Center-TuiText -Text "Discord Fix" -Width $w) -Color White -Width $w
+    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
+
+    Write-TuiLine -Text "  Состояние" -Color White -Width $w
+    Write-TuiStatus -Name "Proxy"   -Value $Snapshot.ProxyState   -ValueColor $Snapshot.ProxyColor   -Width $w
+    Write-TuiStatus -Name "Discord" -Value $Snapshot.DiscordState -ValueColor $Snapshot.DiscordColor -Width $w
+    Write-TuiStatus -Name "Drover"  -Value $Snapshot.DroverState  -ValueColor $Snapshot.DroverColor  -Width $w
+
+    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
+    Write-TuiLine -Text "  Действия" -Color White -Width $w
+
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        Write-TuiOption -Label $items[$i] -Selected ($i -eq $Selected) -Width $w
+    }
+
+    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
+    Write-TuiLine -Text "  Pesherkino VPN — полноценный VPN до 10 устройств" -Color Cyan -Width $w
+    Write-TuiLine -Text "  Бот: @pesherkino_bot    Поддержка: @pesherkino_support" -Color White -Width $w
+    Write-TuiLine -Text "  Новости: t.me/pesherkinonews" -Color DarkGray -Width $w
+    Write-TuiLine -Text "  Сайт: cabinet.netherus.com" -Color DarkGray -Width $w
+    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
+    Write-TuiLine -Text (Center-TuiText -Text "↑ ↓ выбрать   •   Enter подтвердить   •   Esc выйти" -Width $w) -Color DarkGray -Width $w
+    Write-C ("╰" + ("─" * ($w + 2)) + "╯") DarkCyan
+}
+
+function Wait-TuiKey {
+    Write-Host ""
+    Write-C "Нажмите любую клавишу, чтобы вернуться в меню..." DarkGray
+
+    try {
+        [void][Console]::ReadKey($true)
+    }
+    catch {
+        Read-Host "Enter для продолжения" | Out-Null
+    }
+}
+
+function Show-FallbackMenu {
     while ($true) {
         Show-Header
-
         Write-C "1. Установить / обновить" White
         Write-C "2. Repair / переустановить Drover" White
-        Write-C "3. Удалить Pesherkino Discord" White
-        Write-C "4. Статус и проверка proxy" White
+        Write-C "3. Статус и диагностика" White
+        Write-C "4. Удалить Pesherkino Discord" White
         Write-C "0. Выход" DarkGray
         Write-Host ""
 
         switch (Read-Host "Выберите действие") {
             "1" { Deploy-Drover -Mode Install; Read-Host "Enter для продолжения" | Out-Null }
             "2" { Deploy-Drover -Mode Repair; Read-Host "Enter для продолжения" | Out-Null }
-            "3" { Uninstall-PesherkinoDiscord; Read-Host "Enter для продолжения" | Out-Null }
-            "4" { Show-Status; Read-Host "Enter для продолжения" | Out-Null }
+            "3" { Show-Status; Read-Host "Enter для продолжения" | Out-Null }
+            "4" { Uninstall-PesherkinoDiscord; Read-Host "Enter для продолжения" | Out-Null }
             "0" { return }
+        }
+    }
+}
+
+function Show-Menu {
+    $selected = 0
+
+    try {
+        $null = [Console]::KeyAvailable
+    }
+    catch {
+        Show-FallbackMenu
+        return
+    }
+
+    while ($true) {
+        $snapshot = Get-MenuSnapshot
+        $redraw = $true
+
+        while ($redraw) {
+            Draw-MainMenu -Selected $selected -Snapshot $snapshot
+
+            try {
+                $key = [Console]::ReadKey($true)
+            }
+            catch {
+                Show-FallbackMenu
+                return
+            }
+
+            switch ($key.Key) {
+                "UpArrow" {
+                    $selected--
+                    if ($selected -lt 0) { $selected = 4 }
+                }
+
+                "DownArrow" {
+                    $selected++
+                    if ($selected -gt 4) { $selected = 0 }
+                }
+
+                "W" {
+                    $selected--
+                    if ($selected -lt 0) { $selected = 4 }
+                }
+
+                "S" {
+                    $selected++
+                    if ($selected -gt 4) { $selected = 0 }
+                }
+
+                "Escape" {
+                    return
+                }
+
+                "Enter" {
+                    $redraw = $false
+                }
+            }
+        }
+
+        switch ($selected) {
+            0 { Deploy-Drover -Mode Install; Wait-TuiKey }
+            1 { Deploy-Drover -Mode Repair; Wait-TuiKey }
+            2 { Show-Status; Wait-TuiKey }
+            3 { Uninstall-PesherkinoDiscord; Wait-TuiKey }
+            4 { return }
         }
     }
 }
