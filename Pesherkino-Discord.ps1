@@ -1,4 +1,4 @@
-﻿$Action = "Menu"
+$Action = "Menu"
 $AllowedActions = @("Menu","Install","Repair","Uninstall","Status")
 
 if ($args.Count -gt 0) {
