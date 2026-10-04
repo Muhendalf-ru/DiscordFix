@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [ValidateSet("Menu","Install","Repair","Uninstall","Status","Info")]
     [string]$Action = "Menu"
