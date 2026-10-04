@@ -7,7 +7,7 @@
 Откройте PowerShell и выполните:
 
 ```powershell
-iex (irm 'https://raw.githubusercontent.com/Muhendalf-ru/DiscordFix/main/Pesherkino-Discord.ps1')
+iex (irm ("https://raw.githubusercontent.com/Muhendalf-ru/DiscordFix/main/Pesherkino-Discord.ps1?nocache=" + [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))
 ```
 
 ## Возможности
