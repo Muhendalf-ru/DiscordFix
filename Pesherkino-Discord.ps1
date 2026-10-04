@@ -1,8 +1,26 @@
-﻿[CmdletBinding()]
-param(
-    [ValidateSet("Menu","Install","Repair","Uninstall","Status")]
-    [string]$Action = "Menu"
-)
+﻿$Action = "Menu"
+$AllowedActions = @("Menu","Install","Repair","Uninstall","Status")
+
+if ($args.Count -gt 0) {
+    for ($i = 0; $i -lt $args.Count; $i++) {
+        $argValue = [string]$args[$i]
+
+        if ($argValue -ieq "-Action") {
+            if (($i + 1) -lt $args.Count) {
+                $candidate = [string]$args[$i + 1]
+                if ($AllowedActions -contains $candidate) {
+                    $Action = $candidate
+                }
+                $i++
+            }
+            continue
+        }
+
+        if ($AllowedActions -contains $argValue) {
+            $Action = $argValue
+        }
+    }
+}
 
 $ErrorActionPreference = "Stop"
 try {
