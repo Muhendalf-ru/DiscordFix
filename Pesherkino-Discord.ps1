@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-    [ValidateSet("Menu","Install","Repair","Uninstall","Status","Info")]
+    [ValidateSet("Menu","Install","Repair","Uninstall","Status")]
     [string]$Action = "Menu"
 )
 
@@ -31,6 +31,16 @@ function Show-Header {
     Write-C "  • Не работает совместно с Zapret." Yellow
     Write-C "  • Не используйте одновременно с VPN в TUN-режиме." Yellow
     Write-C "  • Это не системный VPN и не меняет proxy Windows." DarkGray
+    Write-Host ""
+    Write-C "------------------------------------------------------------" DarkGray
+    Write-C "Pesherkino VPN" Cyan
+    Write-C "Полноценный VPN для всего устройства — до 10 устройств." White
+    Write-Host ""
+    Write-C "  Бот:       @pesherkino_bot" White
+    Write-C "  Новости:   t.me/pesherkinonews" White
+    Write-C "  Поддержка: @pesherkino_support" White
+    Write-C "  Сайт:      cabinet.netherus.com" White
+    Write-C "------------------------------------------------------------" DarkGray
     Write-Host ""
 }
 
@@ -595,43 +605,6 @@ function Show-Status {
     }
 }
 
-function Show-Info {
-    Show-Header
-
-    Write-C "Что делает Pesherkino Discord" White
-    Write-Host ""
-    Write-Host "  Discord Drover заставляет приложение Discord использовать"
-    Write-Host "  отдельный HTTP proxy для TCP-соединений."
-    Write-Host ""
-    Write-Host "  Сервер разрешает через proxy только Discord-домены."
-    Write-Host "  Посторонние сайты сервером блокируются."
-    Write-Host ""
-    Write-C "Установка и Repair" Cyan
-    Write-Host ""
-    Write-Host "  • Ищет Discord в стандартных папках и через реестр Windows."
-    Write-Host "  • Поддерживает Stable, Canary и PTB."
-    Write-Host "  • Автоматически закрывает запущенный Discord."
-    Write-Host "  • Определяет существующий Discord Drover."
-    Write-Host "  • Install/Repair заменяет старые файлы без backup."
-    Write-Host "  • Скачивает последний release Discord Drover с GitHub."
-    Write-Host "  • Проверяет SHA256 релиза, если GitHub публикует digest."
-    Write-Host "  • Проверяет CONNECT к Discord и блокировку постороннего сайта."
-    Write-Host ""
-    Write-C "Совместимость" Yellow
-    Write-Host ""
-    Write-Host "  • Не работает совместно с Zapret."
-    Write-Host "  • Не используйте одновременно с VPN в TUN-режиме."
-    Write-Host ""
-    Write-C "Pesherkino VPN" Cyan
-    Write-Host ""
-    Write-Host "  Бот:       https://t.me/pesherkino_bot"
-    Write-Host "  Новости:   https://t.me/pesherkinonews"
-    Write-Host "  Поддержка: https://t.me/pesherkino_support"
-    Write-Host ""
-    Write-C "Discord Drover" Cyan
-    Write-Host "  https://github.com/hdrover/discord-drover"
-}
-
 function Show-Menu {
     while ($true) {
         Show-Header
@@ -640,7 +613,6 @@ function Show-Menu {
         Write-C "2. Repair / переустановить Drover" White
         Write-C "3. Удалить Pesherkino Discord" White
         Write-C "4. Статус и проверка proxy" White
-        Write-C "5. Информация / Pesherkino VPN" White
         Write-C "0. Выход" DarkGray
         Write-Host ""
 
@@ -649,7 +621,6 @@ function Show-Menu {
             "2" { Deploy-Drover -Mode Repair; Read-Host "Enter для продолжения" | Out-Null }
             "3" { Uninstall-PesherkinoDiscord; Read-Host "Enter для продолжения" | Out-Null }
             "4" { Show-Status; Read-Host "Enter для продолжения" | Out-Null }
-            "5" { Show-Info; Read-Host "Enter для продолжения" | Out-Null }
             "0" { return }
         }
     }
@@ -660,6 +631,5 @@ switch ($Action) {
     "Repair"    { Deploy-Drover -Mode Repair }
     "Uninstall" { Uninstall-PesherkinoDiscord }
     "Status"    { Show-Status }
-    "Info"      { Show-Info }
     default     { Show-Menu }
 }
