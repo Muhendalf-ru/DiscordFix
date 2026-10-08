@@ -1,5 +1,5 @@
 $Action = "Menu"
-$AllowedActions = @("Menu","Install","InstallDiscord","Repair","Uninstall","Status","Report","Help","About")
+$AllowedActions = @("Menu","Install","InstallDiscord","Repair","Uninstall","Status","Report","Help","About","Compatibility","Happ","Zapret")
 
 if ($args.Count -gt 0) {
     for ($i = 0; $i -lt $args.Count; $i++) {
@@ -1017,6 +1017,439 @@ function Save-DiagnosticReport {
     catch { Show-ActionError $_.Exception.Message "Проверьте доступ к папке документов и попробуйте сохранить отчёт ещё раз." }
 }
 
+function Get-CompatibilityHome {
+    $path = Join-Path $LocalDir "Compatibility"
+    [void][IO.Directory]::CreateDirectory($path)
+    return $path
+}
+
+function New-CompatibilityBackup {
+    param([string]$Kind)
+    $name = $Kind + "-" + [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss") + "-" + [guid]::NewGuid().ToString("N").Substring(0,8)
+    $path = Join-Path (Get-CompatibilityHome) $name
+    [void][IO.Directory]::CreateDirectory($path)
+    return $path
+}
+
+function Write-CompatibilityJson {
+    param([string]$Path, [object]$Value)
+    [IO.File]::WriteAllText($Path,($Value | ConvertTo-Json -Depth 64),(New-Object Text.UTF8Encoding($false)))
+}
+
+function ConvertTo-ProxyCidrs {
+    param([string[]]$Addresses)
+    $result = @()
+    foreach ($address in $Addresses) {
+        $ip = $null
+        if (-not [Net.IPAddress]::TryParse($address.Trim(),[ref]$ip)) { throw "Некорректный IP прокси: $address" }
+        $bytes = $ip.GetAddressBytes()
+        if ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork) {
+            # Reject FakeDNS/benchmark ranges, loopback and non-public answers.
+            if ($bytes[0] -eq 0 -or $bytes[0] -eq 10 -or $bytes[0] -eq 127 -or $bytes[0] -ge 224 -or
+                ($bytes[0] -eq 169 -and $bytes[1] -eq 254) -or ($bytes[0] -eq 172 -and $bytes[1] -ge 16 -and $bytes[1] -le 31) -or
+                ($bytes[0] -eq 192 -and $bytes[1] -eq 168) -or ($bytes[0] -eq 198 -and $bytes[1] -ge 18 -and $bytes[1] -le 19)) {
+                throw "DNS вернул локальный или FakeDNS IP $ip. Нужен настоящий публичный IP сервера прокси."
+            }
+            $result += $ip.ToString() + "/32"
+        }
+        elseif ($ip.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetworkV6) {
+            if (($bytes[0] -band 0xE0) -ne 0x20 -or $ip.ScopeId -ne 0) { throw "Нужен публичный IPv6 прокси: $ip" }
+            $result += $ip.ToString() + "/128"
+        }
+    }
+    if (-not $result.Count) { throw "IP сервера прокси не указан." }
+    return @($result | Sort-Object -Unique)
+}
+
+function Get-CompatibilityProxyCidrs {
+    $addresses = @()
+    try {
+        $lookup = [Net.Dns]::GetHostAddressesAsync($ProxyHost)
+        if (-not $lookup.Wait(5000)) { throw "DNS timeout" }
+        $addresses = @($lookup.Result | ForEach-Object { $_.ToString() })
+        $cidrs = @(ConvertTo-ProxyCidrs $addresses)
+        Write-C ("IP прокси: " + ($cidrs -join ", ")) Gray
+        return $cidrs
+    }
+    catch {
+        Write-C "Не удалось получить настоящий IP прокси. Happ может подменять DNS." Yellow
+        $answer = Read-Host "Укажите публичный IP сервера $ProxyHost (несколько через запятую), Enter — отмена"
+        if ([string]::IsNullOrWhiteSpace($answer)) { return @() }
+        return @(ConvertTo-ProxyCidrs ($answer -split '\s*,\s*'))
+    }
+}
+
+function Read-HappRoutingProfile {
+    param([string]$Text)
+    $Text = $Text.Trim().TrimStart([char]0xFEFF)
+    if ($Text -match '^happ://routing/(?:onadd|add)/([^\s]+)$') {
+        $base64 = [Uri]::UnescapeDataString($Matches[1]).Replace('-','+').Replace('_','/')
+        $base64 = $base64.PadRight($base64.Length + ((4 - $base64.Length % 4) % 4),'=')
+        $Text = (New-Object Text.UTF8Encoding($false,$true)).GetString([Convert]::FromBase64String($base64))
+    }
+    if ($Text.Length -gt 262144) { throw "Профиль маршрутизации слишком большой." }
+    $profile = $Text | ConvertFrom-Json
+    if ($null -eq $profile -or $profile -isnot [pscustomobject] -or
+        [string]::IsNullOrWhiteSpace([string]$profile.Name) -or $null -eq $profile.PSObject.Properties['GlobalProxy']) {
+        throw "Нужен экспорт профиля маршрутизации Happ с Name и GlobalProxy, а не ключ VPN или подписка."
+    }
+    foreach ($key in @('inbounds','outbounds','routing','servers','password','token')) {
+        if ($null -ne $profile.PSObject.Properties[$key]) { throw "Это конфигурация подключения. Экспортируйте только профиль маршрутизации Happ." }
+    }
+    foreach ($key in @('DirectSites','DirectIp','ProxySites','ProxyIp','BlockSites','BlockIp')) {
+        $property = $profile.PSObject.Properties[$key]
+        if ($property -and $null -ne $property.Value) {
+            if ($property.Value -isnot [array]) { throw "Поле $key должно быть массивом." }
+            foreach ($entry in $property.Value) { if ($entry -isnot [string]) { throw "Некорректное правило в $key." } }
+        }
+    }
+    return $profile
+}
+
+function ConvertTo-HappRoutingLink {
+    param([object]$Profile)
+    $json = $Profile | ConvertTo-Json -Depth 64 -Compress
+    return "happ://routing/add/" + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+}
+
+function Add-HappProxyRules {
+    param([object]$Profile, [string[]]$Cidrs)
+    # Clone before editing: exported settings are also the rollback source.
+    $copy = Read-HappRoutingProfile ($Profile | ConvertTo-Json -Depth 64)
+    $domainRule = "full:" + $ProxyHost
+    foreach ($pair in @(@{Key='DirectSites'; Values=@($domainRule)},@{Key='DirectIp'; Values=$Cidrs})) {
+        $values = @($copy.($pair.Key) | Where-Object { $null -ne $_ }) + @($pair.Values)
+        $copy | Add-Member NoteProperty $pair.Key @($values | Select-Object -Unique) -Force
+    }
+    # Only remove exact conflicting rules; broad geosite/geoip rules remain intact.
+    foreach ($key in @('ProxySites','BlockSites')) {
+        if ($copy.PSObject.Properties[$key]) {
+            $values = @($copy.$key | Where-Object { $_ -ine $ProxyHost -and $_ -ine $domainRule -and $_ -ine ('domain:' + $ProxyHost) })
+            $copy.$key = $values
+        }
+    }
+    foreach ($key in @('ProxyIp','BlockIp')) {
+        if ($copy.PSObject.Properties[$key]) {
+            $values = @($copy.$key | Where-Object { $rule = $_; -not (@($Cidrs | ForEach-Object { $_; ($_ -split '/')[0] }) -contains $rule) })
+            $copy.$key = $values
+        }
+    }
+    $hosts = $copy.DnsHosts
+    if ($null -eq $hosts) { $hosts = [pscustomobject]@{} }
+    if ($hosts -isnot [pscustomobject]) { throw "DnsHosts должен быть JSON-объектом." }
+    $ips = @($Cidrs | ForEach-Object { ($_ -split '/')[0] })
+    $hostValue = if ($ips.Count -eq 1) { $ips[0] } else { $ips }
+    $hosts | Add-Member NoteProperty $ProxyHost $hostValue -Force
+    $copy | Add-Member NoteProperty DnsHosts $hosts -Force
+    return $copy
+}
+
+function Open-HappRoutingLink {
+    param([string]$Link)
+    try { Set-Clipboard -Value $Link -ErrorAction Stop; Write-C "Ссылка маршрутизации скопирована. В Happ её можно импортировать из буфера." Gray } catch {}
+    try { Start-Process -FilePath $Link -ErrorAction Stop | Out-Null }
+    catch { Write-C "Не удалось открыть Happ автоматически. Импортируйте сохранённую ссылку из файла routing-link.txt." Yellow }
+}
+
+function Set-HappCompatibility {
+    Show-Header
+    Write-C "Happ TUN · исключение для прокси Pesherkino" Cyan
+    Write-C "В Happ экспортируйте активный профиль маршрутизации нужной подписки." White
+    Write-C "Потребуется ссылка happ://routing/add/... или JSON-файл этого профиля." Gray
+    Write-C "При JSON-подписке, запрещающей импорт маршрутизации, используйте исключение по приложению ниже." Yellow
+    $answer = Read-Host "Вставьте ссылку / путь к JSON-файлу; C — взять из буфера; Enter — показать исключение Discord из TUN"
+    if ([string]::IsNullOrWhiteSpace($answer)) { Show-HappAppBypass; return }
+    if ($answer -ieq 'C') { $answer = [string](Get-Clipboard -Raw -ErrorAction Stop) }
+    $candidate = $answer.Trim().Trim('"')
+    if ($candidate -notmatch '^(happ://|\{)' -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+        if ((Get-Item -LiteralPath $candidate).Length -gt 262144) { throw "JSON-файл слишком большой." }
+        $answer = [IO.File]::ReadAllText($candidate)
+    }
+    $profile = Read-HappRoutingProfile $answer
+    $cidrs = @(Get-CompatibilityProxyCidrs)
+    if (-not $cidrs.Count) { return }
+    $updated = Add-HappProxyRules $profile $cidrs
+    $backup = New-CompatibilityBackup "Happ"
+    Write-CompatibilityJson (Join-Path $backup 'before.json') $profile
+    Write-CompatibilityJson (Join-Path $backup 'routing.json') $updated
+    $link = ConvertTo-HappRoutingLink $updated
+    [IO.File]::WriteAllText((Join-Path $backup 'routing-link.txt'),$link,(New-Object Text.UTF8Encoding($false)))
+    Write-CompatibilityJson (Join-Path $backup 'manifest.json') ([ordered]@{Kind='Happ'; Name=[string]$profile.Name; Created=[DateTime]::UtcNow.ToString('o')})
+    Write-C ("[OK] Профиль подготовлен: " + $profile.Name) Green
+    Write-C ("Резервная копия и ссылка: " + $backup) Gray
+    Open-HappRoutingLink $link
+    Write-C "Завершите импорт в нужную подписку Happ, выберите этот профиль и переподключите TUN." White
+    Write-C "Порядок правил сохранён. Если широкое Proxy/Block-правило перехватывает прокси, проверьте приоритет Direct в Happ." Yellow
+    Write-C "IP закреплён в DnsHosts: при смене IP сервера повторите настройку." Gray
+    Show-HappAppBypass
+}
+
+function Show-HappAppBypass {
+    Write-C "Для голоса: Happ → настройки прокси для приложений → режим исключений (Bypass)." Cyan
+    Write-C "Добавьте установленные Discord / Discord PTB / Discord Canary и переподключите TUN." White
+    Write-C "В актуальном Happ используйте Xray TUN с поддержкой исключений приложений." Gray
+    foreach ($dir in @(Get-ActiveDiscordDirs)) {
+        foreach ($name in @('Discord.exe','DiscordPTB.exe','DiscordCanary.exe')) {
+            $exe = Join-Path $dir $name
+            if (Test-Path -LiteralPath $exe) { Write-C $exe Gray }
+        }
+    }
+    Write-C "После обновления Discord проверьте путь исключения. Затем проверьте вход и голосовой канал." Gray
+    Write-C "Импорт маршрутизации не меняет список приложений автоматически." Gray
+}
+
+function Get-ZapretService {
+    try { return Get-CimInstance Win32_Service -Filter "Name='zapret'" -ErrorAction Stop } catch { return $null }
+}
+
+function Get-WinwsExecutable {
+    param([string]$CommandLine)
+    if ($CommandLine -match '^\s*"([^"]*\\winws\.exe)"(?:\s|$)') { return $Matches[1] }
+    if ($CommandLine -match '^\s*([^\s"]*\\winws\.exe)(?:\s|$)') { return $Matches[1] }
+    return $null
+}
+
+function Test-FlowsealFolder {
+    param([string]$Path)
+    return ((Test-Path -LiteralPath (Join-Path $Path 'service.bat') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $Path 'bin\winws.exe') -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $Path 'lists') -PathType Container) -and
+        @((Get-ChildItem -LiteralPath $Path -Filter 'general*.bat' -File -ErrorAction SilentlyContinue)).Count -gt 0)
+}
+
+function Get-ZapretFolders {
+    $candidates = @()
+    $service = Get-ZapretService
+    if ($service) {
+        $exe = Get-WinwsExecutable $service.PathName
+        if ($exe) { $candidates += Split-Path (Split-Path $exe -Parent) -Parent }
+    }
+    try {
+        foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name='winws.exe'" -ErrorAction Stop)) {
+            if ($process.ExecutablePath) { $candidates += Split-Path (Split-Path $process.ExecutablePath -Parent) -Parent }
+        }
+    } catch {}
+    foreach ($path in @($candidates | Select-Object -Unique)) { if (Test-FlowsealFolder $path) { $path } }
+}
+
+function Select-ZapretFolder {
+    $found = @(Get-ZapretFolders)
+    for ($i=0; $i -lt $found.Count; $i++) { Write-C (([string]($i+1)) + ". " + $found[$i]) White }
+    Write-C "Папка может находиться на любом диске. Укажите корень сборки с service.bat, bin и lists." Gray
+    $answer = Read-Host "Введите путь или номер найденной папки; Enter — отмена"
+    if ([string]::IsNullOrWhiteSpace($answer)) { return $null }
+    $number = 0
+    if ([int]::TryParse($answer,[ref]$number) -and $number -ge 1 -and $number -le $found.Count) { $answer = $found[$number-1] }
+    $path = (Resolve-Path -LiteralPath $answer.Trim().Trim('"') -ErrorAction Stop).ProviderPath
+    if (-not (Test-FlowsealFolder $path)) { throw "В этой папке не найдена сборка Flowseal: нужны service.bat, bin\winws.exe, lists и general*.bat." }
+    # Flowseal's cmd/service parser expands these characters even inside quotes.
+    if ($path -match '[%!\r\n"]') { throw "Для Flowseal нужен путь без %, ! и кавычек. Переместите папку и повторите." }
+    return $path
+}
+
+function Read-ZapretBatch {
+    param([string]$Path)
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -gt 1048576) { throw "Слишком большой BAT: $Path" }
+    $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 239 -and $bytes[1] -eq 187 -and $bytes[2] -eq 191
+    $encoding = New-Object Text.UTF8Encoding($bom,$true)
+    try { $text = $encoding.GetString($bytes).TrimStart([char]0xFEFF) }
+    catch { throw "BAT должен быть в UTF-8, как актуальная сборка Flowseal: $Path" }
+    return [pscustomobject]@{Text=$text; Encoding=$encoding}
+}
+
+function Add-ZapretCompatibilityProfiles {
+    param([string]$Text, [string]$IpSetPath, [switch]$Batch)
+    if ($Text.Contains('pesherkino-proxy-ip.txt')) { return $Text }
+    $checkPath = if ($Batch) { $IpSetPath -replace '^%LISTS%', '' } else { $IpSetPath }
+    if ($checkPath -match '[%!\r\n"]') { throw "Некорректный путь списка IP." }
+    # An action-free profile passes matching packets unchanged. Profiles are first-match.
+    $profiles = '--filter-tcp=' + $ProxyPort + ' --ipset="' + $IpSetPath + '" --new '
+    $profiles += '--filter-udp=19294-19344,50000-65535 --filter-l7=discord,stun --new '
+    $searchStart = 0
+    if ($Batch) {
+        $launches = [regex]::Matches($Text,'(?im)^\s*start\s+[^\r\n]*"%BIN%winws\.exe"[^\r\n]*')
+        if ($launches.Count -ne 1 -or $Text -notmatch '(?im)^\s*set\s+"LISTS=%~dp0lists\\"\s*$') {
+            throw "Неподдерживаемый формат BAT. Ожидается актуальная стратегия Flowseal с одним запуском winws.exe."
+        }
+        $searchStart = $launches[0].Index + $launches[0].Length
+        if (-not $launches[0].Value.TrimEnd().EndsWith('^')) { throw "Параметры winws должны продолжаться на следующей строке." }
+        $newline = if ($Text.Contains("`r`n")) { "`r`n" } else { "`n" }
+        $profiles = $profiles.Replace(' --new ',(' --new ^' + $newline))
+    }
+    $match = [regex]::Match($Text.Substring($searchStart),'--filter-(?:tcp|udp|l7|l3)=')
+    if (-not $match.Success) { throw "Не найдены профили фильтрации winws." }
+    $position = $searchStart + $match.Index
+    if ($Batch -and $Text.Substring($searchStart,$match.Index) -notmatch '^\s*$') { throw "Неизвестные параметры перед первым профилем BAT." }
+    return $Text.Insert($position,$profiles)
+}
+
+function Test-CompatibilityAdmin {
+    try {
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Set-ZapretServicePath {
+    param([string]$PathName)
+    $service = Get-ZapretService
+    if (-not $service) { throw "Служба zapret больше не найдена." }
+    $running = $service.State -eq 'Running'
+    if ($running) { Stop-Service -Name zapret -ErrorAction Stop }
+    try {
+        $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{PathName=$PathName} -ErrorAction Stop
+        if ($result.ReturnValue -ne 0) { throw "Не удалось изменить службу zapret, код $($result.ReturnValue)." }
+    }
+    finally { if ($running) { Start-Service -Name zapret -ErrorAction Stop } }
+}
+
+function Restore-ZapretBackup {
+    param([string]$Backup)
+    $manifest = [IO.File]::ReadAllText((Join-Path $Backup 'manifest.json')) | ConvertFrom-Json
+    if ($manifest.Kind -ne 'Zapret') { throw "Это не резервная копия Zapret." }
+    # Preflight everything: never overwrite edits made after our configuration.
+    foreach ($file in $manifest.Files) {
+        if (Test-Path -LiteralPath $file.Path) {
+            $hash = (Get-FileHash -LiteralPath $file.Path -Algorithm SHA256).Hash
+            if ($hash -ne $file.AfterHash -and $hash -ne $file.BeforeHash) { throw "Файл изменён после настройки: $($file.Path). Сохраните свои изменения перед откатом." }
+        }
+        elseif ($file.BeforeExists) { throw "Исходный файл перемещён или удалён: $($file.Path)." }
+        if ($file.BeforeExists -and (Get-FileHash -LiteralPath (Join-Path $Backup $file.Copy) -Algorithm SHA256).Hash -ne $file.BeforeHash) {
+            throw "Резервная копия повреждена: $($file.Copy)."
+        }
+    }
+    $service = $null
+    if ($manifest.ServiceBefore) {
+        $service = Get-ZapretService
+        if (-not $service -or ($service.PathName -ne $manifest.ServiceAfter -and $service.PathName -ne $manifest.ServiceBefore)) { throw "Конфигурация службы zapret изменилась. Автоматический откат остановлен." }
+        if (-not (Test-CompatibilityAdmin)) { throw "Для отката службы запустите PowerShell от администратора." }
+    }
+    foreach ($file in $manifest.Files) {
+        if ($file.BeforeExists) { [IO.File]::Copy((Join-Path $Backup $file.Copy),$file.Path,$true) }
+        elseif (Test-Path -LiteralPath $file.Path) { Remove-Item -LiteralPath $file.Path -ErrorAction Stop }
+    }
+    if ($service -and $service.PathName -ne $manifest.ServiceBefore) { Set-ZapretServicePath $manifest.ServiceBefore }
+    if ($service -and $manifest.ServiceWasRunning -and (Get-ZapretService).State -ne 'Running') { Start-Service -Name zapret -ErrorAction Stop }
+    $manifest | Add-Member NoteProperty Restored $true -Force
+    Write-CompatibilityJson (Join-Path $Backup 'manifest.json') $manifest
+}
+
+function Set-ZapretCompatibility {
+    Show-Header
+    Write-C "Flowseal Zapret · совместимость с Pesherkino" Cyan
+    $folder = Select-ZapretFolder
+    if (-not $folder) { return }
+    $service = Get-ZapretService
+    $serviceExe = if ($service) { Get-WinwsExecutable $service.PathName } else { $null }
+    $ownsService = $serviceExe -and $serviceExe -ieq (Join-Path $folder 'bin\winws.exe')
+    if ($ownsService -and -not (Test-CompatibilityAdmin)) { throw "Для изменения установленной службы Zapret запустите PowerShell от администратора и повторите этот пункт." }
+    foreach ($directory in @(Get-ChildItem -LiteralPath (Get-CompatibilityHome) -Directory)) {
+        $manifestPath = Join-Path $directory.FullName 'manifest.json'
+        if (Test-Path -LiteralPath $manifestPath) {
+            $old = [IO.File]::ReadAllText($manifestPath) | ConvertFrom-Json
+            if ($old.Kind -eq 'Zapret' -and $old.Folder -ieq $folder -and -not $old.Restored) {
+                Write-C "Эта папка уже настроена. Для смены IP или обновлённой сборки сначала отмените прежние изменения." Yellow
+                return
+            }
+        }
+    }
+    $cidrs = @(Get-CompatibilityProxyCidrs)
+    if (-not $cidrs.Count) { return }
+    $ipset = Join-Path $folder 'lists\pesherkino-proxy-ip.txt'
+    $changes = @([pscustomobject]@{Path=$ipset; Text=($cidrs -join "`r`n") + "`r`n"; Encoding=(New-Object Text.UTF8Encoding($false))})
+    # Prepare every strategy before changing any file, including installed-service arguments.
+    foreach ($bat in @(Get-ChildItem -LiteralPath $folder -Filter 'general*.bat' -File)) {
+        $source = Read-ZapretBatch $bat.FullName
+        $updated = Add-ZapretCompatibilityProfiles $source.Text '%LISTS%pesherkino-proxy-ip.txt' -Batch
+        if ($updated -ne $source.Text) { $changes += [pscustomobject]@{Path=$bat.FullName; Text=$updated; Encoding=$source.Encoding} }
+    }
+    $serviceAfter = if ($ownsService) { Add-ZapretCompatibilityProfiles $service.PathName $ipset } else { $null }
+    $backup = New-CompatibilityBackup 'Zapret'
+    $records = @()
+    foreach ($change in $changes) {
+        $exists = Test-Path -LiteralPath $change.Path -PathType Leaf
+        $copy = [string]$records.Count + '.bak'
+        $beforeHash = $null
+        if ($exists) {
+            [IO.File]::Copy($change.Path,(Join-Path $backup $copy),$false)
+            $beforeHash = (Get-FileHash -LiteralPath $change.Path -Algorithm SHA256).Hash
+        }
+        $records += [pscustomobject]@{Path=$change.Path; Copy=$copy; BeforeExists=$exists; BeforeHash=$beforeHash; AfterHash=$beforeHash}
+    }
+    $manifest = [pscustomobject]@{Kind='Zapret'; Folder=$folder; Created=[DateTime]::UtcNow.ToString('o'); Files=$records;
+        ServiceBefore=$(if ($ownsService) { $service.PathName } else { $null }); ServiceAfter=$serviceAfter;
+        ServiceWasRunning=($ownsService -and $service.State -eq 'Running'); Restored=$false}
+    $manifestPath = Join-Path $backup 'manifest.json'
+    Write-CompatibilityJson $manifestPath $manifest
+    try {
+        for ($i=0; $i -lt $changes.Count; $i++) {
+            [IO.File]::WriteAllText($changes[$i].Path,$changes[$i].Text,$changes[$i].Encoding)
+            $records[$i].AfterHash = (Get-FileHash -LiteralPath $changes[$i].Path -Algorithm SHA256).Hash
+            Write-CompatibilityJson $manifestPath $manifest
+        }
+        if ($ownsService -and $serviceAfter -ne $service.PathName) { Set-ZapretServicePath $serviceAfter }
+    }
+    catch {
+        $failure = $_.Exception.Message
+        try { Restore-ZapretBackup $backup }
+        catch { Write-C ("Автоматический откат не завершён: " + $_.Exception.Message + ". Копии: " + $backup) Red }
+        throw "Настройка Zapret не завершена: $failure"
+    }
+    Write-C ("[OK] Добавлены правила в стратегий: " + ($changes.Count-1)) Green
+    Write-C "Соединение с прокси и распознанный Discord/STUN UDP проходят без дополнительной обработки Zapret." White
+    Write-C ("Резервная копия: " + $backup) Gray
+    if ($ownsService) { Write-C "Параметры службы обновлены; работающая служба перезапущена." Green }
+    else { Write-C "Перезапустите запущенный general*.bat из этой папки, чтобы применить параметры." Yellow }
+    Write-C "Проверьте вход в Discord и голос. После обновления сборки проверьте совместимость повторно." Gray
+}
+
+function Restore-Compatibility {
+    $backups = @(Get-ChildItem -LiteralPath (Get-CompatibilityHome) -Directory | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_.FullName 'manifest.json')
+    } | Sort-Object Name -Descending)
+    if (-not $backups.Count) { Write-C "Резервных копий пока нет." Gray; return }
+    for ($i=0; $i -lt $backups.Count; $i++) { Write-C (([string]($i+1)) + '. ' + $backups[$i].Name) White }
+    $answer = Read-Host "Номер копии для отката; Enter — отмена"
+    $number = 0
+    if (-not [int]::TryParse($answer,[ref]$number) -or $number -lt 1 -or $number -gt $backups.Count) { return }
+    $backup = $backups[$number-1].FullName
+    $manifest = [IO.File]::ReadAllText((Join-Path $backup 'manifest.json')) | ConvertFrom-Json
+    if ($manifest.Kind -eq 'Happ') {
+        $profile = Read-HappRoutingProfile ([IO.File]::ReadAllText((Join-Path $backup 'before.json')))
+        Open-HappRoutingLink (ConvertTo-HappRoutingLink $profile)
+        Write-C "Импортируйте прежний профиль в ту же подписку Happ и переподключите TUN." White
+        Write-C "Исключения приложений, добавленные вручную, убираются в настройках Happ." Gray
+    }
+    elseif ($manifest.Kind -eq 'Zapret') {
+        Restore-ZapretBackup $backup
+        Write-C "[OK] Файлы и параметры службы восстановлены." Green
+        Write-C "Если Zapret запускался через BAT, перезапустите его для применения." Gray
+    }
+}
+
+function Show-Compatibility {
+    while ($true) {
+        Show-Header
+        Write-C "Совместимость" Cyan
+        Write-C "1. Happ TUN — исключения для прокси и инструкция для голоса" White
+        Write-C "2. Flowseal Zapret — настроить выбранную папку" White
+        Write-C "3. Отменить изменения из резервной копии" White
+        Write-C "0. Назад" Gray
+        $choice = Read-Host "Выберите действие"
+        if ([string]::IsNullOrWhiteSpace($choice) -or $choice -eq '0') { return }
+        try {
+            switch ($choice) {
+                '1' { Set-HappCompatibility }
+                '2' { Set-ZapretCompatibility }
+                '3' { Restore-Compatibility }
+                default { continue }
+            }
+        } catch { Show-ActionError $_.Exception.Message "Настройки, копии и откат доступны в разделе совместимости." }
+        Read-Host "Enter для продолжения" | Out-Null
+    }
+}
+
 function Show-Help {
     Show-Header
     Write-C "Помощь и поддержка" Cyan
@@ -1024,7 +1457,7 @@ function Show-Help {
     Write-C "2. Перестал работать после обновления — «Восстановить подключение»." White
     Write-C "3. Проблемы со входом — «Проверить соединение», затем «Сохранить отчёт»." White
     Write-C "Вход выполняется в Discord: пароль и 2FA либо QR-код с телефона." Gray
-    Write-C "Не используйте одновременно с Zapret или VPN в TUN-режиме." Yellow
+    Write-C "Для Happ TUN и Zapret откройте «Совместимость с Happ / Zapret»." Yellow
     Write-C "Поддержка: @pesherkino_support" Cyan
 }
 
@@ -1077,6 +1510,7 @@ function Get-MenuItems {
         [pscustomobject]@{ Key = "5"; Label = "Помощь и поддержка"; Hint = ""; Action = "Help" },
         [pscustomobject]@{ Key = "6"; Label = "О Pesherkino"; Hint = ""; Action = "About" },
         [pscustomobject]@{ Key = "7"; Label = "Удалить подключение"; Hint = "Сам Discord останется"; Action = "Uninstall" },
+        [pscustomobject]@{ Key = "8"; Label = "Совместимость с Happ / Zapret"; Hint = "Исключения, резервные копии и откат"; Action = "Compatibility" },
         [pscustomobject]@{ Key = "0"; Label = "Выход"; Hint = ""; Action = "Exit" }
     )
 }
@@ -1172,6 +1606,9 @@ function Invoke-MenuAction {
         "Report" { Show-Header; Save-DiagnosticReport | Out-Null }
         "Help" { Show-Help }
         "About" { Show-About }
+        "Compatibility" { Show-Compatibility }
+        "Happ" { Set-HappCompatibility }
+        "Zapret" { Set-ZapretCompatibility }
         "Uninstall" { Uninstall-PesherkinoDiscord }
     }
 }
@@ -1257,6 +1694,9 @@ try {
         "Report" { Save-DiagnosticReport | Out-Null }
         "Help" { Show-Help }
         "About" { Show-About }
+        "Compatibility" { Show-Compatibility }
+        "Happ" { Set-HappCompatibility }
+        "Zapret" { Set-ZapretCompatibility }
         default { Show-Menu }
     }
 }
