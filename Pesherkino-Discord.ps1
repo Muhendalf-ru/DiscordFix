@@ -299,6 +299,90 @@ function Test-OfficialDiscordDownloadUri {
     return $false
 }
 
+function New-DownloadProgressState {
+    param([long]$ElapsedMs)
+    $samples = New-Object 'System.Collections.Generic.List[object]'
+    $samples.Add([pscustomobject]@{Bytes=0L; Ms=$ElapsedMs})
+    return [pscustomobject]@{Samples=$samples; LastDrawMs=$ElapsedMs-1000}
+}
+
+function Update-DownloadProgress {
+    param([object]$State, [long]$Bytes, [long]$ExpectedBytes, [long]$ElapsedMs)
+    $State.Samples.Add([pscustomobject]@{Bytes=$Bytes; Ms=$ElapsedMs})
+    # Use the recent five-second window rather than the average since startup.
+    while ($State.Samples.Count -gt 2 -and $State.Samples[1].Ms -le ($ElapsedMs-5000)) { $State.Samples.RemoveAt(0) }
+    $first = $State.Samples[0]
+    $speed = [Math]::Max(0,($Bytes-$first.Bytes)) / [Math]::Max(0.1,($ElapsedMs-$first.Ms)/1000.0)
+    $progress = @{ Activity="Скачивание Discord"; Status=("{0:N1} МБ · {1:N1} МБ/с" -f ($Bytes/1MB),($speed/1MB)) }
+    if ($ExpectedBytes -gt 0) {
+        $progress.Status = "{0:N1} / {1:N1} МБ · {2:N1} МБ/с" -f ($Bytes/1MB),($ExpectedBytes/1MB),($speed/1MB)
+        $progress.PercentComplete = [int][Math]::Min(100,$Bytes*100.0/$ExpectedBytes)
+        if ($speed -gt 0) { $progress.SecondsRemaining = [int][Math]::Min([int]::MaxValue,[Math]::Max(0,($ExpectedBytes-$Bytes)/$speed)) }
+    }
+    Write-Progress @progress
+}
+
+function ConvertTo-NativeArgument {
+    param([AllowEmptyString()][string]$Value)
+    # Quote for ProcessStartInfo.Arguments (Windows CRT); no cmd or PowerShell shell.
+    return '"' + (($Value -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+}
+
+function Receive-DiscordInstallerWithCurl {
+    param([string]$CurlPath, [uri]$Uri, [string]$OutFile, [long]$ExpectedBytes,
+        [Diagnostics.Stopwatch]$Watch, [switch]$UseProxy)
+    if (-not (Test-OfficialDiscordDownloadUri $Uri)) { throw "Недопустимый адрес загрузки Discord." }
+    $remaining = [int][Math]::Floor(1200-$Watch.Elapsed.TotalSeconds)
+    if ($remaining -le 0) { throw "Превышено время загрузки Discord (20 минут)." }
+    $proxy = if ($UseProxy) { $ProxyUri } else { '' }
+    $arguments = @('--disable','--fail','--silent','--show-error','--proto','=https',
+        '--connect-timeout','30','--max-time',[string]$remaining,'--max-filesize',[string](512MB),
+        '--proxy',$proxy,'--noproxy','','--user-agent','Pesherkino-Discord-Installer',
+        '--output',$OutFile,'--write-out','%{http_code}',$Uri.AbsoluteUri)
+    # No --location: redirects were validated above, and a new redirect must fail.
+    $info = New-Object Diagnostics.ProcessStartInfo
+    $info.FileName = $CurlPath
+    $info.Arguments = ($arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' '
+    $info.UseShellExecute = $false
+    $info.CreateNoWindow = $true
+    $info.RedirectStandardOutput = $true
+    $info.RedirectStandardError = $true
+    $process = New-Object Diagnostics.Process
+    $process.StartInfo = $info
+    $state = New-DownloadProgressState $Watch.ElapsedMilliseconds
+    try {
+        if (-not $process.Start()) { throw "Не удалось запустить curl.exe." }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        while (-not $process.WaitForExit(250)) {
+            $size = 0L
+            if (Test-Path -LiteralPath $OutFile) { $size = (Get-Item -LiteralPath $OutFile).Length }
+            if ($size -gt 512MB -or $Watch.Elapsed.TotalMinutes -ge 20) { throw "Превышен лимит размера или времени загрузки Discord." }
+            if (($Watch.ElapsedMilliseconds-$state.LastDrawMs) -ge 1000) {
+                Update-DownloadProgress $state $size $ExpectedBytes $Watch.ElapsedMilliseconds
+                # Rendering may be slow in Windows PowerShell. Throttle after rendering.
+                $state.LastDrawMs = $Watch.ElapsedMilliseconds
+            }
+        }
+        $process.WaitForExit()
+        $httpCode = $stdout.Result.Trim()
+        $errorText = $stderr.Result.Trim()
+        if ($process.ExitCode -ne 0) {
+            if ($errorText.Length -gt 500) { $errorText = $errorText.Substring(0,500) }
+            throw "curl.exe завершился с кодом $($process.ExitCode): $errorText"
+        }
+        if ($httpCode -ne '200') { throw "Сервер загрузки вернул HTTP $httpCode. Автоматические перенаправления curl отключены." }
+        $size = (Get-Item -LiteralPath $OutFile -ErrorAction Stop).Length
+        if ($size -eq 0 -or $size -gt 512MB -or ($ExpectedBytes -gt 0 -and $size -ne $ExpectedBytes)) {
+            throw "Установщик Discord скачан не полностью или превышает допустимый размер."
+        }
+    }
+    finally {
+        try { if ($process.Id -and -not $process.HasExited) { $process.Kill(); $process.WaitForExit(5000) | Out-Null } } catch {}
+        $process.Dispose()
+    }
+}
+
 function Receive-DiscordInstaller {
     param([string]$OutFile, [switch]$UseProxy)
 
@@ -306,6 +390,7 @@ function Receive-DiscordInstaller {
     $uri = [uri]$DiscordDownloadUrl
     $oldTls = [Net.ServicePointManager]::SecurityProtocol
     $watch = [Diagnostics.Stopwatch]::StartNew()
+    $curl = Get-Command curl.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     try {
         [Net.ServicePointManager]::SecurityProtocol = $oldTls -bor [Net.SecurityProtocolType]::Tls12
         for ($hop = 0; $hop -lt 10; $hop++) {
@@ -334,28 +419,29 @@ function Receive-DiscordInstaller {
                 if ($code -ne 200) { throw "Сервер загрузки Discord вернул HTTP $code." }
                 if ($response.ContentLength -gt 512MB) { throw "Установщик Discord слишком большой." }
 
+                if ($curl) {
+                    $expectedBytes = $response.ContentLength
+                    $response.Close()
+                    $response = $null
+                    Write-C "[*] Загрузка через curl.exe." Gray
+                    Receive-DiscordInstallerWithCurl -CurlPath $curl.Source -Uri $uri -OutFile $OutFile -ExpectedBytes $expectedBytes -Watch $watch -UseProxy:$UseProxy
+                    return
+                }
+
                 $inputStream = $response.GetResponseStream()
                 $outputStream = [IO.File]::Create($OutFile)
                 $buffer = New-Object byte[] 65536
                 $total = 0L
-                $lastProgressMs = -1000
+                $state = New-DownloadProgressState $watch.ElapsedMilliseconds
                 while (($read = $inputStream.Read($buffer,0,$buffer.Length)) -gt 0) {
                     $total += $read
-                    if ($total -gt 512MB -or $watch.Elapsed.TotalMinutes -ge 5) {
+                    if ($total -gt 512MB -or $watch.Elapsed.TotalMinutes -ge 20) {
                         throw "Превышен лимит размера или времени загрузки Discord."
                     }
                     $outputStream.Write($buffer,0,$read)
-                    if (($watch.ElapsedMilliseconds - $lastProgressMs) -ge 200) {
-                        $lastProgressMs = $watch.ElapsedMilliseconds
-                        $speed = $total / [Math]::Max(0.1,$watch.Elapsed.TotalSeconds)
-                        $status = "{0:N1} МБ · {1:N1} МБ/с" -f ($total / 1MB),($speed / 1MB)
-                        $progress = @{ Activity = "Скачивание Discord"; Status = $status }
-                        if ($response.ContentLength -gt 0) {
-                            $progress.Status = "{0:N1} / {1:N1} МБ · {2:N1} МБ/с" -f ($total / 1MB),($response.ContentLength / 1MB),($speed / 1MB)
-                            $progress.PercentComplete = [int][Math]::Min(100, ($total * 100.0 / $response.ContentLength))
-                            $progress.SecondsRemaining = [int][Math]::Max(0,($response.ContentLength - $total) / [Math]::Max(1,$speed))
-                        }
-                        Write-Progress @progress
+                    if (($watch.ElapsedMilliseconds - $state.LastDrawMs) -ge 1000) {
+                        Update-DownloadProgress $state $total $response.ContentLength $watch.ElapsedMilliseconds
+                        $state.LastDrawMs = $watch.ElapsedMilliseconds
                     }
                 }
                 if ($total -eq 0 -or ($response.ContentLength -gt 0 -and $total -ne $response.ContentLength)) {
