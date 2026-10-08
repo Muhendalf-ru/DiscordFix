@@ -1,4 +1,4 @@
-﻿$Action = "Menu"
+$Action = "Menu"
 $AllowedActions = @("Menu","Install","InstallDiscord","Repair","Uninstall","Status","Report","Help","About")
 
 if ($args.Count -gt 0) {
