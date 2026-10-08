@@ -1,5 +1,5 @@
-$Action = "Menu"
-$AllowedActions = @("Menu","Install","InstallDiscord","Repair","Uninstall","Status")
+﻿$Action = "Menu"
+$AllowedActions = @("Menu","Install","InstallDiscord","Repair","Uninstall","Status","Report","Help","About")
 
 if ($args.Count -gt 0) {
     for ($i = 0; $i -lt $args.Count; $i++) {
@@ -37,23 +37,77 @@ $DiscordDownloadUrl = "https://discord.com/api/downloads/distributions/app/insta
 
 $ReleaseApi = "https://api.github.com/repos/hdrover/discord-drover/releases/latest"
 $LocalDir   = Join-Path $env:LOCALAPPDATA "Pesherkino\DiscordDrover"
+$script:SessionEvents = New-Object System.Collections.Generic.List[string]
+$script:ProxySnapshot = $null
+$script:LastDiagnostic = @()
+$script:UseAnsi = $false
+$script:MenuLayout = $null
+$script:OriginalBackground = $null
+$script:OriginalForeground = $null
+try {
+    $script:OriginalBackground = $Host.UI.RawUI.BackgroundColor
+    $script:OriginalForeground = $Host.UI.RawUI.ForegroundColor
+    $Host.UI.RawUI.BackgroundColor = [ConsoleColor]::Black
+    $Host.UI.RawUI.ForegroundColor = [ConsoleColor]::Gray
+} catch {}
+try { $script:UseAnsi = [bool]$Host.UI.SupportsVirtualTerminal -and -not [Console]::IsOutputRedirected } catch {}
+$script:Accent = [ConsoleColor]::DarkYellow
+
+function Protect-ReportText {
+    param([string]$Text)
+    foreach ($entry in @(
+        @{ Value = $env:LOCALAPPDATA; Label = "%LOCALAPPDATA%" },
+        @{ Value = $env:USERPROFILE; Label = "%USERPROFILE%" }
+    )) {
+        if ($entry.Value) { $Text = $Text -replace [regex]::Escape($entry.Value), $entry.Label }
+    }
+    $Text = $Text -replace '(?i)(https?://)[^/\s@]+@', '$1[credentials]@'
+    $Text = $Text -replace '(?im)((?:authorization|cookie)\s*[=:]\s*)[^\r\n]+', '$1[hidden]'
+    return ($Text -replace '(?i)((?:token|password)\s*[=:]\s*)[^\s;]+', '$1[hidden]')
+}
+
+function Write-Accent {
+    param([string]$Text, [switch]$NoNewline)
+    if ($script:UseAnsi) {
+        $esc = [char]27
+        Write-Host ("${esc}[38;2;255;171;88m" + $Text + "${esc}[0m") -NoNewline:$NoNewline
+    }
+    else { Write-Host $Text -ForegroundColor $script:Accent -NoNewline:$NoNewline }
+}
+
+function Get-TuiWidth {
+    $available = 72
+    try { if ([Console]::WindowWidth -gt 0) { $available = [Console]::WindowWidth - 5 } } catch {}
+    return [Math]::Max(24, [Math]::Min(72, $available))
+}
+
+function Write-InstallStage {
+    param([int]$Step, [int]$Total, [string]$Text)
+    Write-Accent ("[$Step/$Total] $Text")
+    $script:SessionEvents.Add(("{0:HH:mm:ss} | {1}/{2} | {3}" -f [DateTime]::Now,$Step,$Total,$Text))
+}
+
+function Show-ActionError {
+    param([string]$Message, [string]$Advice = "Выберите «Проверить соединение», затем сохраните отчёт для @pesherkino_support.")
+    Write-C ("[Ошибка] " + $Message) Red
+    Write-C ("Что сделать: " + $Advice) Yellow
+}
 
 function Write-C {
     param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Gray)
-    Write-Host $Text -ForegroundColor $Color
+    $script:SessionEvents.Add(("{0:HH:mm:ss} | {1}" -f [DateTime]::Now,(Protect-ReportText $Text)))
+    # Keep reports compact during long sessions.
+    if ($script:SessionEvents.Count -gt 300) { $script:SessionEvents.RemoveAt(0) }
+    if ($Color -eq [ConsoleColor]::Cyan) { Write-Accent $Text }
+    else { Write-Host $Text -ForegroundColor $Color }
 }
 
 function Show-Header {
     Clear-Host
-    $w = 64
-
-    Write-C ("╭" + ("─" * ($w + 2)) + "╮") DarkCyan
-    Write-C ("│ " + ("PESHERKINO DISCORD".PadLeft([int](($w + 18) / 2))).PadRight($w) + " │") Cyan
-    Write-C ("│ " + ("Discord Fix".PadLeft([int](($w + 11) / 2))).PadRight($w) + " │") White
-    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
-    Write-C ("│ " + "Discord через отдельный Pesherkino proxy".PadRight($w) + " │") White
-    Write-C ("│ " + "Не используйте одновременно с Zapret или VPN в TUN-режиме.".PadRight($w) + " │") Yellow
-    Write-C ("╰" + ("─" * ($w + 2)) + "╯") DarkCyan
+    Write-Host "PESHERKINO " -NoNewline -ForegroundColor White
+    Write-Accent "DISCORD"
+    Write-Host "Работаем ради вас" -ForegroundColor Gray
+    Write-Host ("─" * (Get-TuiWidth)) -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -284,17 +338,25 @@ function Receive-DiscordInstaller {
                 $outputStream = [IO.File]::Create($OutFile)
                 $buffer = New-Object byte[] 65536
                 $total = 0L
+                $lastProgressMs = -1000
                 while (($read = $inputStream.Read($buffer,0,$buffer.Length)) -gt 0) {
                     $total += $read
                     if ($total -gt 512MB -or $watch.Elapsed.TotalMinutes -ge 5) {
                         throw "Превышен лимит размера или времени загрузки Discord."
                     }
                     $outputStream.Write($buffer,0,$read)
-                    $progress = @{ Activity = "Скачиваю Discord"; Status = ("{0:N1} МБ" -f ($total / 1MB)) }
-                    if ($response.ContentLength -gt 0) {
-                        $progress.PercentComplete = [int][Math]::Min(100, ($total * 100.0 / $response.ContentLength))
+                    if (($watch.ElapsedMilliseconds - $lastProgressMs) -ge 200) {
+                        $lastProgressMs = $watch.ElapsedMilliseconds
+                        $speed = $total / [Math]::Max(0.1,$watch.Elapsed.TotalSeconds)
+                        $status = "{0:N1} МБ · {1:N1} МБ/с" -f ($total / 1MB),($speed / 1MB)
+                        $progress = @{ Activity = "Скачивание Discord"; Status = $status }
+                        if ($response.ContentLength -gt 0) {
+                            $progress.Status = "{0:N1} / {1:N1} МБ · {2:N1} МБ/с" -f ($total / 1MB),($response.ContentLength / 1MB),($speed / 1MB)
+                            $progress.PercentComplete = [int][Math]::Min(100, ($total * 100.0 / $response.ContentLength))
+                            $progress.SecondsRemaining = [int][Math]::Max(0,($response.ContentLength - $total) / [Math]::Max(1,$speed))
+                        }
+                        Write-Progress @progress
                     }
-                    Write-Progress @progress
                 }
                 if ($total -eq 0 -or ($response.ContentLength -gt 0 -and $total -ne $response.ContentLength)) {
                     throw "Установщик Discord скачан не полностью."
@@ -311,7 +373,7 @@ function Receive-DiscordInstaller {
     }
     finally {
         [Net.ServicePointManager]::SecurityProtocol = $oldTls
-        Write-Progress -Activity "Скачиваю Discord" -Completed
+        Write-Progress -Activity "Скачивание Discord" -Completed
     }
 }
 
@@ -339,7 +401,7 @@ function Install-DiscordApplication {
     }
     if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
         -not [Environment]::Is64BitOperatingSystem) {
-        Write-C "[ERROR] Установка Discord поддерживается на 64-битной Windows." Red
+        Show-ActionError "Установка Discord поддерживается на 64-битной Windows." "Запустите скрипт на компьютере с 64-битной Windows."
         return $false
     }
 
@@ -349,6 +411,7 @@ function Install-DiscordApplication {
     New-Item -ItemType Directory -Path $work -Force | Out-Null
     try {
         $setup = Join-Path $work "DiscordSetup.exe"
+        Write-InstallStage 1 7 "Скачивание Discord"
         Write-C "[*] Скачиваю оригинальный Discord Stable через Pesherkino proxy..." Cyan
         try {
             Receive-DiscordInstaller -OutFile $setup -UseProxy
@@ -359,15 +422,17 @@ function Install-DiscordApplication {
             Remove-Item -LiteralPath $setup -Force -ErrorAction SilentlyContinue
             Receive-DiscordInstaller -OutFile $setup
         }
+        Write-InstallStage 2 7 "Проверка цифровой подписи"
         Assert-DiscordInstallerSignature -Path $setup
         Stop-Discord
-        Write-C "[*] Запускаю официальный установщик Discord. Дождитесь завершения." Cyan
+        Write-InstallStage 3 7 "Установка приложения"
+        Write-C "Дождитесь завершения официального установщика Discord." Gray
         $setupProcess = Start-Process -FilePath $setup -PassThru
         $watch = [Diagnostics.Stopwatch]::StartNew()
         while (-not $setupProcess.WaitForExit(1000)) {
             if ($watch.Elapsed.TotalMinutes -ge 5) {
                 $keepWork = $true
-                throw "Установщик ещё работает. Завершите установку в его окне, затем выберите «Установить / обновить»."
+                throw "Установщик ещё работает. Завершите установку в его окне, затем выберите основное действие в меню."
             }
         }
         if ($setupProcess.ExitCode -ne 0) {
@@ -389,8 +454,7 @@ function Install-DiscordApplication {
         return $true
     }
     catch {
-        Write-C ("[ERROR] " + $_.Exception.Message) Red
-        Write-C "Прокси должен разрешать discord.com и CDN *.discordapp.net. Поддержка: @pesherkino_support" Yellow
+        Show-ActionError $_.Exception.Message "Проверьте окно установщика и соединение. Для загрузки прокси должен разрешать discord.com и *.discordapp.net. Сохраните отчёт при повторной ошибке."
         return $false
     }
     finally {
@@ -400,14 +464,21 @@ function Install-DiscordApplication {
 }
 
 function Start-DiscordForLogin {
-    $dir = Get-DiscordDirs | Where-Object {
-        (Test-Path -LiteralPath (Join-Path $_ "Discord.exe") -PathType Leaf) -and
-        (Get-DroverState -Dir $_) -eq "Pesherkino"
-    } | Sort-Object { try { [version](Split-Path -Leaf $_).Substring(4) } catch { [version]"0.0" } } -Descending |
-        Select-Object -First 1
-    if (-not $dir) { throw "Discord Stable с настроенным Drover не найден." }
+    $candidates = @()
+    foreach ($dir in @(Get-ActiveDiscordDirs)) {
+        if ((Get-DroverState -Dir $dir) -ne "Pesherkino") { continue }
+        foreach ($exe in @("Discord.exe","DiscordPTB.exe","DiscordCanary.exe")) {
+            $path = Join-Path $dir $exe
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $candidates += [pscustomobject]@{ Directory = $dir; Path = $path; Stable = ($exe -eq "Discord.exe") }
+                break
+            }
+        }
+    }
+    $target = $candidates | Sort-Object Stable -Descending | Select-Object -First 1
+    if (-not $target) { throw "Актуальная версия Discord с настроенным подключением не найдена. Выберите «Восстановить подключение»." }
     # Launch the patched executable directly for the first login.
-    Start-Process -FilePath (Join-Path $dir "Discord.exe") -WorkingDirectory $dir | Out-Null
+    Start-Process -FilePath $target.Path -WorkingDirectory $target.Directory | Out-Null
     Write-C "[OK] Discord запущен через Pesherkino proxy." Green
     Write-C "Войдите в окне Discord: почта/пароль и 2FA либо QR-код с телефона." White
 }
@@ -415,9 +486,9 @@ function Start-DiscordForLogin {
 function Install-DiscordAndDrover {
     Show-Header
     if (Install-DiscordApplication) {
-        if (Deploy-Drover -Mode Install) {
+        if (Deploy-Drover -Mode Install -ContinueInstallation) {
             try { Start-DiscordForLogin }
-            catch { Write-C ("[!] Не удалось открыть Discord: " + $_.Exception.Message + ". Запустите его вручную.") Yellow }
+            catch { Show-ActionError $_.Exception.Message "Запустите Discord вручную или выберите «Восстановить подключение»." }
         }
     }
 }
@@ -537,7 +608,8 @@ function Test-ProxyConnect {
 function Test-PesherkinoProxy {
     param([switch]$Quiet)
 
-    $discord = Test-ProxyConnect -TargetHost "discord.com" -TargetPort 443
+    $network = Get-ProxySnapshot -Refresh
+    $discord = $network.Discord
 
     if (-not $discord.Success) {
         if (-not $Quiet) {
@@ -549,12 +621,12 @@ function Test-PesherkinoProxy {
         return $false
     }
 
-    $blocked = Test-ProxyConnect -TargetHost "example.com" -TargetPort 443
+    $blocked = $network.Blocked
 
-    if ($blocked.Success) {
+    if ($blocked.StatusCode -ne 403) {
         if (-not $Quiet) {
-            Write-C "[ERROR] Проверка безопасности провалена: example.com разрешён через proxy." Red
-            Write-C "Установка остановлена: proxy должен пропускать только Discord." Yellow
+            if ($blocked.Success) { Show-ActionError "Прокси разрешает example.com." "Проверьте FilterDefaultDeny Yes и список разрешённых доменов Tinyproxy." }
+            else { Show-ActionError ("Запрет посторонних сайтов не подтверждён: " + $blocked.StatusLine) "Повторите проверку соединения. Для подтверждения запрета ожидается HTTP 403 от прокси." }
         }
         return $false
     }
@@ -628,21 +700,26 @@ function Save-LocalCopy {
 function Deploy-Drover {
     param(
         [ValidateSet("Install","Repair")]
-        [string]$Mode
+        [string]$Mode,
+        [switch]$ContinueInstallation
     )
 
-    Show-Header
+    if (-not $ContinueInstallation) { Show-Header }
 
     $newDiscord = $false
+    $combined = [bool]$ContinueInstallation
     $dirs = @(Get-DiscordDirs)
     if ($dirs.Count -eq 0 -and $Mode -eq "Install") {
         Write-C "[*] Discord не найден. Сначала устанавливаю приложение." Cyan
         if (-not (Install-DiscordApplication)) { return $false }
         $newDiscord = $true
+        $combined = $true
         $dirs = @(Get-DiscordDirs)
     }
 
-    Write-C "[*] Проверяю реальное соединение через Pesherkino proxy..." Cyan
+    $steps = if ($combined) { 7 } else { 4 }
+    $offset = if ($combined) { 3 } else { 0 }
+    Write-InstallStage (1 + $offset) $steps "Проверка подключения"
     if (-not (Test-PesherkinoProxy)) {
         Write-Host ""
         Write-C "Поддержка: @pesherkino_support" Yellow
@@ -653,7 +730,7 @@ function Deploy-Drover {
         Write-Host ""
         Write-C "[ERROR] Discord Stable / PTB / Canary не найден." Red
         Write-C "Проверены стандартные пути, реестр Windows и Discord URI registration." DarkGray
-        Write-C "Выберите «Скачать и установить Discord» в меню." Yellow
+        Write-C "Выберите «Установить Discord» в меню." Yellow
         return $false
     }
 
@@ -678,7 +755,9 @@ function Deploy-Drover {
     New-Item -ItemType Directory -Path $work -Force | Out-Null
 
     try {
+        Write-InstallStage (2 + $offset) $steps "Загрузка компонентов подключения"
         $files = Download-Drover -WorkDir $work
+        Write-InstallStage (3 + $offset) $steps "Настройка подключения"
         $ini = "[drover]" + [Environment]::NewLine + "proxy = " + $ProxyUri + [Environment]::NewLine
         $count = 0
 
@@ -709,25 +788,26 @@ function Deploy-Drover {
 
         Write-Host ""
         if ($Mode -eq "Repair") {
-            Write-C "[OK] Repair завершён." Green
+            Write-C "[OK] Подключение восстановлено." Green
         }
         else {
-            Write-C "[OK] Pesherkino Discord установлен/обновлён." Green
+            Write-C "[OK] Подключение Pesherkino настроено." Green
         }
 
-        Write-C ("[OK] Discord Drover: " + $files.Version) Green
+        Write-C ("[OK] Версия компонентов подключения: " + $files.Version) Green
         Write-C ("[OK] Обработано папок Discord: " + $count) Green
         Write-Host ""
-        Write-C "Теперь запусти Discord обычным способом." White
+        Write-InstallStage $steps $steps "Готово. Discord готов к запуску"
+        Write-C "Откройте Discord обычным способом или основным действием в меню." White
         if ($newDiscord) {
             try { Start-DiscordForLogin }
-            catch { Write-C ("[!] Не удалось открыть Discord: " + $_.Exception.Message + ". Запустите его вручную.") Yellow }
+            catch { Show-ActionError $_.Exception.Message "Запустите Discord вручную или выберите «Восстановить подключение»." }
         }
         return $true
     }
     catch {
         Write-Host ""
-        Write-C ("[ERROR] " + $_.Exception.Message) Red
+        Show-ActionError $_.Exception.Message
         return $false
     }
     finally {
@@ -737,6 +817,13 @@ function Deploy-Drover {
 
 function Uninstall-PesherkinoDiscord {
     Show-Header
+
+    Write-C "Будут удалены компоненты и настройки подключения Pesherkino." Yellow
+    Write-C "Приложение Discord останется установленным." White
+    if ((Read-Host "Для подтверждения введите ДА") -ine "ДА") {
+        Write-C "Удаление отменено." Gray
+        return
+    }
 
     $dirs = @(Get-DiscordDirs)
 
@@ -776,340 +863,406 @@ function Uninstall-PesherkinoDiscord {
         Remove-Item -LiteralPath $LocalDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    Write-C ("[OK] Pesherkino Discord удалён. Обработано папок: " + $count) Green
+    Write-C ("[OK] Подключение Pesherkino удалено. Обработано папок: " + $count) Green
+}
+
+function Get-ActiveDiscordDirs {
+    $groups = @(Get-DiscordDirs) | Group-Object {
+        if ((Split-Path -Leaf $_) -like "app-*") { Split-Path -Parent $_ } else { $_ }
+    }
+    foreach ($group in $groups) {
+        $group.Group | Sort-Object {
+            try { [version](Split-Path -Leaf $_).Substring(4) } catch { [version]"0.0" }
+        } -Descending | Select-Object -First 1
+    }
+}
+
+function Get-ProxySnapshot {
+    param([switch]$Refresh)
+    if (-not $Refresh -and $script:ProxySnapshot -and
+        ([DateTime]::UtcNow - $script:ProxySnapshot.CheckedAt).TotalSeconds -lt 30) {
+        return $script:ProxySnapshot
+    }
+    $discord = Test-ProxyConnect -TargetHost "discord.com"
+    $blocked = $null
+    $state = "Недоступен"
+    $color = [ConsoleColor]::Red
+    if ($discord.Success) {
+        $blocked = Test-ProxyConnect -TargetHost "example.com"
+        if ($blocked.StatusCode -eq 403) { $state = "Доступен · CONNECT"; $color = [ConsoleColor]::Green }
+        elseif ($blocked.Success) { $state = "Посторонние сайты разрешены"; $color = [ConsoleColor]::Yellow }
+        else { $state = "Фильтр не удалось проверить"; $color = [ConsoleColor]::Yellow }
+    }
+    $script:ProxySnapshot = [pscustomobject]@{
+        CheckedAt = [DateTime]::UtcNow; Discord = $discord; Blocked = $blocked; State = $state; Color = $color
+    }
+    return $script:ProxySnapshot
+}
+
+function Get-MenuSnapshot {
+    param([switch]$RefreshNetwork, [switch]$SkipNetwork)
+    $dirs = @(Get-ActiveDiscordDirs)
+    $states = @($dirs | ForEach-Object { Get-DroverState -Dir $_ })
+    $primaryLabel = "Установить Discord"
+    $primaryHint = "И настроить подключение"
+    $primaryAction = "InstallDiscord"
+    $droverState = "Не настроено"
+    $droverColor = [ConsoleColor]::Gray
+    if ($dirs.Count -gt 0) {
+        $primaryLabel = "Настроить подключение"; $primaryHint = "Через прокси Pesherkino"; $primaryAction = "Install"
+        if (@($states | Where-Object { $_ -ne "Pesherkino" }).Count -eq 0) {
+            $droverState = "Настроено"; $droverColor = [ConsoleColor]::Green
+            $primaryLabel = "Открыть Discord"; $primaryHint = "Войти в аккаунт или продолжить"; $primaryAction = "Launch"
+        }
+        elseif ($states -contains "Pesherkino" -or $states -contains "PesherkinoPartial" -or $states -contains "Partial") {
+            $droverState = "Нужно восстановить"; $droverColor = [ConsoleColor]::Yellow
+            $primaryLabel = "Восстановить подключение"; $primaryHint = "Настроить актуальную версию"; $primaryAction = "Repair"
+        }
+        elseif ($states -contains "OtherDrover") { $droverState = "Другие настройки"; $droverColor = [ConsoleColor]::Yellow }
+        # A Discord update creates a new app-* directory without our files.
+        elseif (@(Get-DiscordDirs | Where-Object { (Get-DroverState -Dir $_) -eq "Pesherkino" }).Count -gt 0) {
+            $droverState = "Нужно восстановить"; $droverColor = [ConsoleColor]::Yellow
+            $primaryLabel = "Восстановить подключение"; $primaryHint = "После обновления Discord"; $primaryAction = "Repair"
+        }
+    }
+    $network = $script:ProxySnapshot
+    if (-not $SkipNetwork) { $network = Get-ProxySnapshot -Refresh:$RefreshNetwork }
+    return [pscustomobject]@{
+        ProxyState = if ($network) { $network.State } else { "Не проверен" }
+        ProxyColor = if ($network) { $network.Color } else { [ConsoleColor]::Gray }
+        DiscordState = if ($dirs.Count -gt 0) { "Установлен · вариантов: " + $dirs.Count } else { "Не установлен" }
+        DiscordColor = if ($dirs.Count -gt 0) { [ConsoleColor]::Green } else { [ConsoleColor]::Gray }
+        DroverState = $droverState; DroverColor = $droverColor
+        PrimaryLabel = $primaryLabel; PrimaryHint = $primaryHint; PrimaryAction = $primaryAction
+        Directories = $dirs
+    }
+}
+
+function Test-DiscordWebRequest {
+    param([string]$Uri, [string]$Method = "Get")
+    $oldTls = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $oldTls -bor [Net.SecurityProtocolType]::Tls12
+        $response = Invoke-WebRequest -Uri $Uri -Method $Method -Proxy $ProxyUri -UseBasicParsing -TimeoutSec 20 -MaximumRedirection 8
+        return [pscustomobject]@{ Success = $true; StatusCode = [int]$response.StatusCode; Detail = "HTTPS доступен" }
+    }
+    catch {
+        $code = 0
+        try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+        return [pscustomobject]@{ Success = $false; StatusCode = $code; Detail = Protect-ReportText $_.Exception.Message }
+    }
+    finally { [Net.ServicePointManager]::SecurityProtocol = $oldTls }
 }
 
 function Show-Status {
     Show-Header
-
-    Write-C ("Proxy: " + $ProxyHost + ":" + $ProxyPort) White
-
-    $discordTest = Test-ProxyConnect -TargetHost "discord.com" -TargetPort 443
-    $blockedTest = Test-ProxyConnect -TargetHost "example.com" -TargetPort 443
-
-    if ($discordTest.Success) {
-        Write-C "Discord CONNECT: работает" Green
-    }
-    else {
-        Write-C ("Discord CONNECT: ошибка — " + $discordTest.StatusLine) Red
-    }
-
-    if (-not $blockedTest.Success) {
-        Write-C ("Ограничение proxy: работает (example.com запрещён, HTTP " + $blockedTest.StatusCode + ")") Green
-    }
-    else {
-        Write-C "Ограничение proxy: ОШИБКА — example.com разрешён" Red
-    }
-
-    Write-Host ""
-
-    $dirs = @(Get-DiscordDirs)
-
-    if ($dirs.Count -eq 0) {
-        Write-C "Discord не найден." Yellow
-        return
-    }
-
-    foreach ($dir in $dirs) {
-        $state = Get-DroverState -Dir $dir
-
-        switch ($state) {
-            "Pesherkino"        { Write-C ("[OK] Pesherkino Drover — " + $dir) Green }
-            "PesherkinoPartial" { Write-C ("[!] Неполная Pesherkino-установка — " + $dir) Yellow }
-            "OtherDrover"       { Write-C ("[!] Установлен другой Drover — " + $dir) Yellow }
-            "Partial"           { Write-C ("[!] Найдены отдельные файлы Drover — " + $dir) Yellow }
-            default             { Write-C ("[--] Drover не установлен — " + $dir) DarkGray }
-        }
-    }
-}
-
-function Get-MenuSnapshot {
-    $dirs = @(Get-DiscordDirs)
-
-    $discordFound = ($dirs.Count -gt 0)
-    $droverState = "NOT INSTALLED"
-    $droverColor = [ConsoleColor]::DarkGray
-
-    if ($discordFound) {
-        $states = @()
-        foreach ($dir in $dirs) {
-            $states += (Get-DroverState -Dir $dir)
-        }
-
-        if ($states -contains "Pesherkino") {
-            $droverState = "INSTALLED"
-            $droverColor = [ConsoleColor]::Green
-        }
-        elseif (($states -contains "PesherkinoPartial") -or ($states -contains "Partial")) {
-            $droverState = "REPAIR NEEDED"
-            $droverColor = [ConsoleColor]::Yellow
-        }
-        elseif ($states -contains "OtherDrover") {
-            $droverState = "OTHER DROVER"
-            $droverColor = [ConsoleColor]::Yellow
-        }
-    }
-
-    $discordTest = Test-ProxyConnect -TargetHost "discord.com" -TargetPort 443
-    $blockedTest = $null
-
-    if ($discordTest.Success) {
-        $blockedTest = Test-ProxyConnect -TargetHost "example.com" -TargetPort 443
-    }
-
-    $proxyState = "OFFLINE"
-    $proxyColor = [ConsoleColor]::Red
-
-    if ($discordTest.Success) {
-        if ($blockedTest -and $blockedTest.Success) {
-            $proxyState = "UNSAFE"
-            $proxyColor = [ConsoleColor]::Yellow
-        }
-        else {
-            $proxyState = "ONLINE"
-            $proxyColor = [ConsoleColor]::Green
-        }
-    }
-
-    return [pscustomobject]@{
-        ProxyState   = $proxyState
-        ProxyColor   = $proxyColor
-        DiscordState = if ($discordFound) { "FOUND (" + $dirs.Count + ")" } else { "NOT FOUND" }
-        DiscordColor = if ($discordFound) { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
-        DroverState  = $droverState
-        DroverColor  = $droverColor
-    }
-}
-
-function Center-TuiText {
-    param(
-        [string]$Text,
-        [int]$Width
+    Write-C "Проверяю соединение. Это может занять около минуты." Cyan
+    $network = Get-ProxySnapshot -Refresh
+    $gateway = Test-ProxyConnect -TargetHost "gateway.discord.gg"
+    $api = Test-DiscordWebRequest -Uri "https://discord.com/api/v10/gateway"
+    $download = Test-DiscordWebRequest -Uri $DiscordDownloadUrl -Method Head
+    $script:LastDiagnostic = @(
+        [pscustomobject]@{ Name = "Прокси → discord.com"; Good = $network.Discord.Success; Code = $network.Discord.StatusCode; Detail = $network.Discord.StatusLine },
+        [pscustomobject]@{ Name = "Посторонние сайты запрещены"; Good = ($network.Blocked -and $network.Blocked.StatusCode -eq 403); Code = if ($network.Blocked) { $network.Blocked.StatusCode } else { 0 }; Detail = if ($network.Blocked) { $network.Blocked.StatusLine } else { "Не проверено: прокси недоступен" } },
+        [pscustomobject]@{ Name = "Gateway · CONNECT"; Good = $gateway.Success; Code = $gateway.StatusCode; Detail = $gateway.StatusLine },
+        [pscustomobject]@{ Name = "API Discord · HTTPS"; Good = $api.Success; Code = $api.StatusCode; Detail = $api.Detail },
+        [pscustomobject]@{ Name = "Установщик · HTTPS и CDN"; Good = $download.Success; Code = $download.StatusCode; Detail = $download.Detail }
     )
+    Write-Host ""
+    foreach ($check in $script:LastDiagnostic) {
+        $mark = if ($check.Good) { "[OK]" } else { "[!]" }
+        $color = if ($check.Good) { [ConsoleColor]::Green } else { [ConsoleColor]::Yellow }
+        Write-C ("$mark " + $check.Name + " · HTTP " + $check.Code) $color
+        if (-not $check.Good) { Write-C ("    " + $check.Detail) Gray }
+    }
+    $snapshot = Get-MenuSnapshot -SkipNetwork
+    Write-C ("Discord: " + $snapshot.DiscordState) $snapshot.DiscordColor
+    Write-C ("Подключение: " + $snapshot.DroverState) $snapshot.DroverColor
+    Write-C "Проверка Gateway подтверждает CONNECT, вход и голос проверяются в приложении." Gray
+    if (@($script:LastDiagnostic | Where-Object { -not $_.Good }).Count -gt 0) {
+        Write-C "Что сделать: проверьте интернет, доступ к прокси и его список разрешённых доменов." Yellow
+        Write-C "Для поддержки выберите «Сохранить отчёт»." Yellow
+    }
+}
 
-    if ($null -eq $Text) { $Text = "" }
-    if ($Text.Length -ge $Width) { return $Text.Substring(0,$Width) }
+function Save-DiagnosticReport {
+    try {
+        $folder = [Environment]::GetFolderPath([Environment+SpecialFolder]::MyDocuments)
+        if ([string]::IsNullOrWhiteSpace($folder)) { $folder = Join-Path $env:LOCALAPPDATA "Pesherkino" }
+        $folder = Join-Path $folder "Pesherkino-Reports"
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
+        $path = Join-Path $folder ("Pesherkino-Discord-" + [DateTime]::Now.ToString("yyyyMMdd-HHmmss-fff") + ".txt")
+        $snapshot = Get-MenuSnapshot -SkipNetwork
+        $lines = New-Object System.Collections.Generic.List[string]
+        $lines.Add("Pesherkino Discord | интерфейс 2.1")
+        $lines.Add("Дата: " + [DateTimeOffset]::Now.ToString("o"))
+        $lines.Add("PowerShell: " + $PSVersionTable.PSVersion)
+        $lines.Add("ОС: " + [Environment]::OSVersion.Version + "; x64: " + [Environment]::Is64BitOperatingSystem)
+        $lines.Add("Прокси: " + $ProxyHost + ":" + $ProxyPort)
+        $lines.Add("Discord: " + $snapshot.DiscordState + "; подключение: " + $snapshot.DroverState)
+        foreach ($dir in $snapshot.Directories) { $lines.Add("Версия Discord: " + (Protect-ReportText $dir)) }
+        $lines.Add(""); $lines.Add("Последняя диагностика:")
+        if ($script:LastDiagnostic.Count -eq 0) { $lines.Add("Не выполнялась. Выберите «Проверить соединение» для подробностей.") }
+        foreach ($check in $script:LastDiagnostic) {
+            $lines.Add(("{0}: {1}; HTTP {2}; {3}" -f $check.Name,$check.Good,$check.Code,(Protect-ReportText $check.Detail)))
+        }
+        $lines.Add(""); $lines.Add("События этой сессии:")
+        foreach ($event in $script:SessionEvents) { $lines.Add((Protect-ReportText $event)) }
+        [IO.File]::WriteAllLines($path,$lines.ToArray(),(New-Object Text.UTF8Encoding($true)))
+        Write-C "[OK] Отчёт сохранён:" Green
+        Write-C $path White
+        Write-C "Просмотрите файл и при необходимости отправьте его в @pesherkino_support." Gray
+        return $path
+    }
+    catch { Show-ActionError $_.Exception.Message "Проверьте доступ к папке документов и попробуйте сохранить отчёт ещё раз." }
+}
 
-    $left = [int][Math]::Floor(($Width - $Text.Length) / 2)
-    return ((" " * $left) + $Text).PadRight($Width)
+function Show-Help {
+    Show-Header
+    Write-C "Помощь и поддержка" Cyan
+    Write-C "1. Discord отсутствует — выберите «Установить Discord»." White
+    Write-C "2. Перестал работать после обновления — «Восстановить подключение»." White
+    Write-C "3. Проблемы со входом — «Проверить соединение», затем «Сохранить отчёт»." White
+    Write-C "Вход выполняется в Discord: пароль и 2FA либо QR-код с телефона." Gray
+    Write-C "Не используйте одновременно с Zapret или VPN в TUN-режиме." Yellow
+    Write-C "Поддержка: @pesherkino_support" Cyan
+}
+
+function Show-About {
+    Show-Header
+    Write-C "Pesherkino VPN · Работаем ради вас" Cyan
+    Write-C "Бот: https://t.me/pesherkino_bot" White
+    Write-C "Новости: https://t.me/pesherkinonews" White
+    Write-C "Сайт: https://cabinet.netherus.com" White
+    Write-C "Поддержка: https://t.me/pesherkino_support" White
+    Write-C "Подключение Discord использует Discord Drover." Gray
+    Write-C "Оригинальный проект: https://github.com/hdrover/discord-drover" Gray
+}
+
+function Split-TuiText {
+    param([string]$Text, [int]$Width)
+    $Text = $Text -replace '[\r\n\t]', ' '
+    $Width = [Math]::Max(1,$Width)
+    while ($Text.Length -gt $Width) {
+        $break = $Text.LastIndexOf(' ', $Width - 1, $Width)
+        if ($break -le 0) { $break = $Width }
+        $Text.Substring(0,$break)
+        $Text = $Text.Substring($break).TrimStart()
+    }
+    $Text
 }
 
 function Write-TuiLine {
-    param(
-        [string]$Text = "",
-        [ConsoleColor]$Color = [ConsoleColor]::Gray,
-        [int]$Width = 64
-    )
-
-    if ($null -eq $Text) { $Text = "" }
-    if ($Text.Length -gt $Width) {
-        $Text = $Text.Substring(0,$Width)
+    param([string]$Text = "", [ConsoleColor]$Color = [ConsoleColor]::Gray, [int]$Width = 64)
+    foreach ($line in @(Split-TuiText -Text $Text -Width $Width)) {
+        Write-Host "│ " -NoNewline -ForegroundColor DarkGray
+        if ($Color -eq $script:Accent) { Write-Accent $line.PadRight($Width) -NoNewline }
+        else { Write-Host $line.PadRight($Width) -NoNewline -ForegroundColor $Color }
+        Write-Host " │" -ForegroundColor DarkGray
     }
-
-    Write-Host "│ " -NoNewline -ForegroundColor DarkCyan
-    Write-Host $Text.PadRight($Width) -NoNewline -ForegroundColor $Color
-    Write-Host " │" -ForegroundColor DarkCyan
 }
 
 function Write-TuiStatus {
-    param(
-        [string]$Name,
-        [string]$Value,
-        [ConsoleColor]$ValueColor,
-        [int]$Width = 64
+    param([string]$Name, [string]$Value, [ConsoleColor]$ValueColor, [int]$Width = 64)
+    Write-TuiLine -Text (("  " + $Name + ": ").PadRight(16) + $Value) -Color $ValueColor -Width $Width
+}
+
+function Get-MenuItems {
+    param([object]$Snapshot)
+    return @(
+        [pscustomobject]@{ Key = "1"; Label = $Snapshot.PrimaryLabel; Hint = $Snapshot.PrimaryHint; Action = $Snapshot.PrimaryAction },
+        [pscustomobject]@{ Key = "2"; Label = "Восстановить подключение"; Hint = "Если Discord перестал работать"; Action = "Repair" },
+        [pscustomobject]@{ Key = "3"; Label = "Проверить соединение"; Hint = "Прокси, API и сервер загрузки"; Action = "Status" },
+        [pscustomobject]@{ Key = "4"; Label = "Сохранить отчёт"; Hint = "Для обращения в поддержку"; Action = "Report" },
+        [pscustomobject]@{ Key = "5"; Label = "Помощь и поддержка"; Hint = ""; Action = "Help" },
+        [pscustomobject]@{ Key = "6"; Label = "О Pesherkino"; Hint = ""; Action = "About" },
+        [pscustomobject]@{ Key = "7"; Label = "Удалить подключение"; Hint = "Сам Discord останется"; Action = "Uninstall" },
+        [pscustomobject]@{ Key = "0"; Label = "Выход"; Hint = ""; Action = "Exit" }
     )
-
-    $prefix = ("  " + $Name).PadRight(14)
-    $valueText = "● " + $Value
-    $remaining = $Width - $prefix.Length
-
-    if ($valueText.Length -gt $remaining) {
-        $valueText = $valueText.Substring(0,$remaining)
-    }
-
-    Write-Host "│ " -NoNewline -ForegroundColor DarkCyan
-    Write-Host $prefix -NoNewline -ForegroundColor DarkGray
-    Write-Host $valueText.PadRight($remaining) -NoNewline -ForegroundColor $ValueColor
-    Write-Host " │" -ForegroundColor DarkCyan
 }
 
 function Write-TuiOption {
-    param(
-        [string]$Label,
-        [bool]$Selected,
-        [int]$Width = 64
-    )
-
-    $text = if ($Selected) { "  ▶  " + $Label } else { "     " + $Label }
-
-    if ($text.Length -gt $Width) {
-        $text = $text.Substring(0,$Width)
+    param([object]$Item, [bool]$Selected, [int]$Width = 64)
+    $marker = if ($Selected) { "›" } else { " " }
+    $prefix = " $marker [$($Item.Key)] "
+    $first = $true
+    foreach ($line in @(Split-TuiText $Item.Label ($Width - $prefix.Length))) {
+        $text = if ($first) { $prefix + $line } else { (" " * $prefix.Length) + $line }
+        $first = $false
+        Write-Host "│ " -NoNewline -ForegroundColor DarkGray
+        if ($Selected) {
+            if ($script:UseAnsi) {
+                $esc = [char]27
+                Write-Host ("${esc}[48;2;52;39;25m${esc}[38;2;255;171;88m" + $text.PadRight($Width) + "${esc}[0m") -NoNewline
+            }
+            else { Write-Host $text.PadRight($Width) -NoNewline -ForegroundColor Yellow -BackgroundColor DarkGray }
+        }
+        else { Write-Host $text.PadRight($Width) -NoNewline -ForegroundColor Gray }
+        Write-Host " │" -ForegroundColor DarkGray
     }
-
-    Write-Host "│ " -NoNewline -ForegroundColor DarkCyan
-
-    if ($Selected) {
-        Write-Host $text.PadRight($Width) -NoNewline -ForegroundColor White -BackgroundColor DarkCyan
-    }
-    else {
-        Write-Host $text.PadRight($Width) -NoNewline -ForegroundColor Gray
-    }
-
-    Write-Host " │" -ForegroundColor DarkCyan
+    if ($Item.Hint) { Write-TuiLine -Text ((" " * $prefix.Length) + $Item.Hint) -Width $Width -Color DarkGray }
 }
 
 function Draw-MainMenu {
-    param(
-        [int]$Selected,
-        [object]$Snapshot
-    )
-
-    $w = 64
-    $items = @(
-        "Установить / обновить",
-        "Скачать и установить Discord",
-        "Repair / переустановить Drover",
-        "Статус и диагностика",
-        "Удалить Pesherkino Discord",
-        "Выход"
-    )
-
+    param([int]$Selected, [object]$Snapshot)
     Clear-Host
-
-    Write-C ("╭" + ("─" * ($w + 2)) + "╮") DarkCyan
-    Write-TuiLine -Text (Center-TuiText -Text "PESHERKINO" -Width $w) -Color Cyan -Width $w
-    Write-TuiLine -Text (Center-TuiText -Text "Discord Fix" -Width $w) -Color White -Width $w
-    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
-
-    Write-TuiLine -Text "  Состояние" -Color White -Width $w
-    Write-TuiStatus -Name "Proxy"   -Value $Snapshot.ProxyState   -ValueColor $Snapshot.ProxyColor   -Width $w
-    Write-TuiStatus -Name "Discord" -Value $Snapshot.DiscordState -ValueColor $Snapshot.DiscordColor -Width $w
-    Write-TuiStatus -Name "Drover"  -Value $Snapshot.DroverState  -ValueColor $Snapshot.DroverColor  -Width $w
-
-    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
-    Write-TuiLine -Text "  Действия" -Color White -Width $w
-
+    $w = Get-TuiWidth
+    $items = @(Get-MenuItems $Snapshot)
+    # Fit a standard 80x24 terminal; detailed hints remain in Help.
+    try {
+        if ([Console]::WindowHeight -gt 0 -and [Console]::WindowHeight -lt 32) {
+            for ($i = 1; $i -lt $items.Count; $i++) { $items[$i].Hint = "" }
+        }
+    } catch {}
+    Write-Host ("╭" + ("─" * ($w + 2)) + "╮") -ForegroundColor DarkGray
+    Write-TuiLine " PESHERKINO DISCORD" $script:Accent $w
+    Write-TuiLine " Работаем ради вас" Gray $w
+    Write-Host ("├" + ("─" * ($w + 2)) + "┤") -ForegroundColor DarkGray
+    Write-TuiStatus "Прокси" $Snapshot.ProxyState $Snapshot.ProxyColor $w
+    Write-TuiStatus "Discord" $Snapshot.DiscordState $Snapshot.DiscordColor $w
+    Write-TuiStatus "Подключение" $Snapshot.DroverState $Snapshot.DroverColor $w
+    Write-Host ("├" + ("─" * ($w + 2)) + "┤") -ForegroundColor DarkGray
+    $rows = @()
     for ($i = 0; $i -lt $items.Count; $i++) {
-        Write-TuiOption -Label $items[$i] -Selected ($i -eq $Selected) -Width $w
+        $top = $null
+        try { $top = [Console]::CursorTop } catch {}
+        $rows += $top
+        Write-TuiOption $items[$i] ($i -eq $Selected) $w
     }
+    Write-Host ("├" + ("─" * ($w + 2)) + "┤") -ForegroundColor DarkGray
+    Write-TuiLine " @pesherkino_support" Gray $w
+    Write-TuiLine " ↑ ↓ / W S · Enter · Esc · R обновить" DarkGray $w
+    Write-TuiLine " Действие также можно выбрать цифрой" DarkGray $w
+    Write-Host ("╰" + ("─" * ($w + 2)) + "╯") -ForegroundColor DarkGray
+    $end = $null
+    try { $end = [Console]::CursorTop } catch {}
+    $script:MenuLayout = [pscustomobject]@{ Rows = $rows; End = $end; Width = $w; Items = $items }
+}
 
-    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
-    Write-TuiLine -Text "  Pesherkino VPN — полноценный VPN до 10 устройств" -Color Cyan -Width $w
-    Write-TuiLine -Text "  Бот: @pesherkino_bot    Поддержка: @pesherkino_support" -Color White -Width $w
-    Write-TuiLine -Text "  Новости: t.me/pesherkinonews" -Color DarkGray -Width $w
-    Write-TuiLine -Text "  Сайт: cabinet.netherus.com" -Color DarkGray -Width $w
-    Write-C ("├" + ("─" * ($w + 2)) + "┤") DarkCyan
-    Write-TuiLine -Text (Center-TuiText -Text "↑ ↓ выбрать   •   Enter подтвердить   •   Esc выйти" -Width $w) -Color DarkGray -Width $w
-    Write-C ("╰" + ("─" * ($w + 2)) + "╯") DarkCyan
+function Update-MenuSelection {
+    param([int]$Previous, [int]$Selected)
+    try {
+        $layout = $script:MenuLayout
+        if (-not $layout -or $null -eq $layout.End -or $layout.Width -ne (Get-TuiWidth)) { return $false }
+        foreach ($index in @($Previous,$Selected)) {
+            if ($null -eq $layout.Rows[$index]) { return $false }
+            [Console]::SetCursorPosition(0,$layout.Rows[$index])
+            Write-TuiOption $layout.Items[$index] ($index -eq $Selected) $layout.Width
+        }
+        [Console]::SetCursorPosition(0,$layout.End)
+        return $true
+    }
+    catch { return $false }
 }
 
 function Wait-TuiKey {
     Write-Host ""
-    Write-C "Нажмите любую клавишу, чтобы вернуться в меню..." DarkGray
+    Write-Host "Нажмите любую клавишу, чтобы вернуться в меню..." -ForegroundColor Gray
+    try { [void][Console]::ReadKey($true) } catch { Read-Host "Enter для продолжения" | Out-Null }
+}
 
-    try {
-        [void][Console]::ReadKey($true)
-    }
-    catch {
-        Read-Host "Enter для продолжения" | Out-Null
+function Invoke-MenuAction {
+    param([string]$Action)
+    switch ($Action) {
+        "InstallDiscord" { Install-DiscordAndDrover }
+        "Install" { Deploy-Drover -Mode Install | Out-Null }
+        "Repair" { Deploy-Drover -Mode Repair | Out-Null }
+        "Launch" { Show-Header; Start-DiscordForLogin }
+        "Status" { Show-Status }
+        "Report" { Show-Header; Save-DiagnosticReport | Out-Null }
+        "Help" { Show-Help }
+        "About" { Show-About }
+        "Uninstall" { Uninstall-PesherkinoDiscord }
     }
 }
 
 function Show-FallbackMenu {
     while ($true) {
         Show-Header
-        Write-C "1. Установить / обновить" White
-        Write-C "2. Repair / переустановить Drover" White
-        Write-C "3. Статус и диагностика" White
-        Write-C "4. Удалить Pesherkino Discord" White
-        Write-C "5. Скачать и установить Discord" White
-        Write-C "0. Выход" DarkGray
-        Write-Host ""
-
-        switch (Read-Host "Выберите действие") {
-            "1" { Deploy-Drover -Mode Install | Out-Null; Read-Host "Enter для продолжения" | Out-Null }
-            "2" { Deploy-Drover -Mode Repair | Out-Null; Read-Host "Enter для продолжения" | Out-Null }
-            "3" { Show-Status; Read-Host "Enter для продолжения" | Out-Null }
-            "4" { Uninstall-PesherkinoDiscord; Read-Host "Enter для продолжения" | Out-Null }
-            "5" { Install-DiscordAndDrover; Read-Host "Enter для продолжения" | Out-Null }
-            "0" { return }
-        }
+        $snapshot = Get-MenuSnapshot
+        Write-C ("Прокси: " + $snapshot.ProxyState) $snapshot.ProxyColor
+        Write-C ("Discord: " + $snapshot.DiscordState + "; подключение: " + $snapshot.DroverState) White
+        $items = @(Get-MenuItems $snapshot)
+        foreach ($item in $items) { Write-C ($item.Key + ". " + $item.Label) White }
+        Write-C "R. Обновить состояние" Gray
+        $choice = Read-Host "Выберите действие"
+        # Read-Host returns an empty value at EOF when stdin is redirected.
+        if ($null -eq $choice -or ([Console]::IsInputRedirected -and [string]::IsNullOrEmpty($choice))) { return }
+        if ($choice -ieq "r") { $null = Get-MenuSnapshot -RefreshNetwork; continue }
+        $item = $items | Where-Object Key -eq $choice | Select-Object -First 1
+        if (-not $item) { continue }
+        if ($item.Action -eq "Exit") { return }
+        try { Invoke-MenuAction $item.Action } catch { Show-ActionError $_.Exception.Message }
+        Read-Host "Enter для продолжения" | Out-Null
     }
 }
 
 function Show-Menu {
     $selected = 0
-
     try {
         $null = [Console]::KeyAvailable
+        if ([Console]::IsInputRedirected -or [Console]::WindowWidth -lt 45 -or [Console]::WindowHeight -lt 24) { throw "Use text menu" }
     }
-    catch {
-        Show-FallbackMenu
-        return
-    }
-
-    while ($true) {
+    catch { Show-FallbackMenu; return }
+    $cursorVisible = $true
+    try { $cursorVisible = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch {}
+    try {
+        Show-Header
+        Write-Host "Проверяю подключение..." -ForegroundColor Gray
         $snapshot = Get-MenuSnapshot
-        $redraw = $true
-
-        while ($redraw) {
-            Draw-MainMenu -Selected $selected -Snapshot $snapshot
-
-            try {
-                $key = [Console]::ReadKey($true)
-            }
-            catch {
-                Show-FallbackMenu
-                return
-            }
-
-            switch ($key.Key) {
-                "UpArrow" {
-                    $selected--
-                    if ($selected -lt 0) { $selected = 5 }
-                }
-
-                "DownArrow" {
-                    $selected++
-                    if ($selected -gt 5) { $selected = 0 }
-                }
-
-                "W" {
-                    $selected--
-                    if ($selected -lt 0) { $selected = 5 }
-                }
-
-                "S" {
-                    $selected++
-                    if ($selected -gt 5) { $selected = 0 }
-                }
-
-                "Escape" {
-                    return
-                }
-
-                "Enter" {
-                    $redraw = $false
+        Draw-MainMenu $selected $snapshot
+        while ($true) {
+            try { $key = [Console]::ReadKey($true) } catch { Show-FallbackMenu; return }
+            $items = @(Get-MenuItems $snapshot)
+            $previous = $selected
+            $execute = $false
+            switch ([string]$key.Key) {
+                "UpArrow" { $selected = ($selected + $items.Count - 1) % $items.Count }
+                "W" { $selected = ($selected + $items.Count - 1) % $items.Count }
+                "DownArrow" { $selected = ($selected + 1) % $items.Count }
+                "S" { $selected = ($selected + 1) % $items.Count }
+                "Escape" { return }
+                "R" { $snapshot = Get-MenuSnapshot -RefreshNetwork; Draw-MainMenu $selected $snapshot }
+                "Enter" { $execute = $true }
+                default {
+                    for ($i = 0; $i -lt $items.Count; $i++) {
+                        if ([string]$key.KeyChar -eq $items[$i].Key) { $selected = $i; $execute = $true; break }
+                    }
                 }
             }
-        }
-
-        switch ($selected) {
-            0 { Deploy-Drover -Mode Install | Out-Null; Wait-TuiKey }
-            1 { Install-DiscordAndDrover; Wait-TuiKey }
-            2 { Deploy-Drover -Mode Repair | Out-Null; Wait-TuiKey }
-            3 { Show-Status; Wait-TuiKey }
-            4 { Uninstall-PesherkinoDiscord; Wait-TuiKey }
-            5 { return }
+            if ($execute) {
+                if ($items[$selected].Action -eq "Exit") { return }
+                try { [Console]::CursorVisible = $true } catch {}
+                try { Invoke-MenuAction $items[$selected].Action } catch { Show-ActionError $_.Exception.Message }
+                Wait-TuiKey
+                try { [Console]::CursorVisible = $false } catch {}
+                $snapshot = Get-MenuSnapshot
+                Draw-MainMenu $selected $snapshot
+            }
+            elseif ($previous -ne $selected) {
+                if (-not (Update-MenuSelection $previous $selected)) { Draw-MainMenu $selected $snapshot }
+            }
         }
     }
+    finally { try { [Console]::CursorVisible = $cursorVisible } catch {} }
 }
 
-switch ($Action) {
-    "Install"   { Deploy-Drover -Mode Install | Out-Null }
-    "InstallDiscord" { Install-DiscordAndDrover }
-    "Repair"    { Deploy-Drover -Mode Repair | Out-Null }
-    "Uninstall" { Uninstall-PesherkinoDiscord }
-    "Status"    { Show-Status }
-    default     { Show-Menu }
+try {
+    switch ($Action) {
+        "Install" { Deploy-Drover -Mode Install | Out-Null }
+        "InstallDiscord" { Install-DiscordAndDrover }
+        "Repair" { Deploy-Drover -Mode Repair | Out-Null }
+        "Uninstall" { Uninstall-PesherkinoDiscord }
+        "Status" { Show-Status }
+        "Report" { Save-DiagnosticReport | Out-Null }
+        "Help" { Show-Help }
+        "About" { Show-About }
+        default { Show-Menu }
+    }
+}
+finally {
+    try {
+        if ($null -ne $script:OriginalBackground) { $Host.UI.RawUI.BackgroundColor = $script:OriginalBackground }
+        if ($null -ne $script:OriginalForeground) { $Host.UI.RawUI.ForegroundColor = $script:OriginalForeground }
+    } catch {}
 }
