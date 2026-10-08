@@ -1537,6 +1537,26 @@ function Write-TuiOption {
     if ($Item.Hint) { Write-TuiLine -Text ((" " * $prefix.Length) + $Item.Hint) -Width $Width -Color DarkGray }
 }
 
+function Write-PromoBlock {
+    param([switch]$Framed, [int]$Width = 64)
+    $title = " PESHERKINO VPN · Работаем ради вас"
+    $offer = " Подключиться: https://t.me/pesherkino_bot"
+    $support = " Поддержка: @pesherkino_support"
+    if ($Framed) {
+        Write-Accent ("├" + ("─" * ($Width + 2)) + "┤")
+        Write-TuiLine $title $script:Accent $Width
+        Write-TuiLine $offer White $Width
+        Write-TuiLine $support Gray $Width
+    }
+    else {
+        Write-Accent ("─" * (Get-TuiWidth))
+        Write-Accent $title.Trim()
+        Write-Host $offer.Trim() -ForegroundColor White
+        Write-Host $support.Trim() -ForegroundColor Gray
+        Write-Accent ("─" * (Get-TuiWidth))
+    }
+}
+
 function Draw-MainMenu {
     param([int]$Selected, [object]$Snapshot)
     Clear-Host
@@ -1545,12 +1565,11 @@ function Draw-MainMenu {
     # Fit a standard 80x24 terminal; detailed hints remain in Help.
     try {
         if ([Console]::WindowHeight -gt 0 -and [Console]::WindowHeight -lt 32) {
-            for ($i = 1; $i -lt $items.Count; $i++) { $items[$i].Hint = "" }
+            for ($i = 0; $i -lt $items.Count; $i++) { $items[$i].Hint = "" }
         }
     } catch {}
     Write-Host ("╭" + ("─" * ($w + 2)) + "╮") -ForegroundColor DarkGray
     Write-TuiLine " PESHERKINO DISCORD" $script:Accent $w
-    Write-TuiLine " Работаем ради вас" Gray $w
     Write-Host ("├" + ("─" * ($w + 2)) + "┤") -ForegroundColor DarkGray
     Write-TuiStatus "Прокси" $Snapshot.ProxyState $Snapshot.ProxyColor $w
     Write-TuiStatus "Discord" $Snapshot.DiscordState $Snapshot.DiscordColor $w
@@ -1564,9 +1583,8 @@ function Draw-MainMenu {
         Write-TuiOption $items[$i] ($i -eq $Selected) $w
     }
     Write-Host ("├" + ("─" * ($w + 2)) + "┤") -ForegroundColor DarkGray
-    Write-TuiLine " @pesherkino_support" Gray $w
-    Write-TuiLine " ↑ ↓ / W S · Enter · Esc · R обновить" DarkGray $w
-    Write-TuiLine " Действие также можно выбрать цифрой" DarkGray $w
+    Write-TuiLine " ↑ ↓ / W S · Enter · Esc · R обновить · выбор цифрой" DarkGray $w
+    Write-PromoBlock -Framed -Width $w
     Write-Host ("╰" + ("─" * ($w + 2)) + "╯") -ForegroundColor DarkGray
     $end = $null
     try { $end = [Console]::CursorTop } catch {}
@@ -1622,6 +1640,7 @@ function Show-FallbackMenu {
         $items = @(Get-MenuItems $snapshot)
         foreach ($item in $items) { Write-C ($item.Key + ". " + $item.Label) White }
         Write-C "R. Обновить состояние" Gray
+        Write-PromoBlock
         $choice = Read-Host "Выберите действие"
         # Read-Host returns an empty value at EOF when stdin is redirected.
         if ($null -eq $choice -or ([Console]::IsInputRedirected -and [string]::IsNullOrEmpty($choice))) { return }
@@ -1638,7 +1657,7 @@ function Show-Menu {
     $selected = 0
     try {
         $null = [Console]::KeyAvailable
-        if ([Console]::IsInputRedirected -or [Console]::WindowWidth -lt 45 -or [Console]::WindowHeight -lt 24) { throw "Use text menu" }
+        if ([Console]::IsInputRedirected -or [Console]::WindowWidth -lt 70 -or [Console]::WindowHeight -lt 24) { throw "Use text menu" }
     }
     catch { Show-FallbackMenu; return }
     $cursorVisible = $true
