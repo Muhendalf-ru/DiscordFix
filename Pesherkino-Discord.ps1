@@ -1,5 +1,5 @@
 $Action = "Menu"
-$AllowedActions = @("Menu","Install","Repair","Uninstall","Status")
+$AllowedActions = @("Menu","Install","InstallDiscord","Repair","Uninstall","Status")
 
 if ($args.Count -gt 0) {
     for ($i = 0; $i -lt $args.Count; $i++) {
@@ -32,6 +32,8 @@ try { $Host.UI.RawUI.WindowTitle = "Pesherkino Discord" } catch {}
 $ProxyHost = "dearly.netherus.com"
 $ProxyPort = 5555
 $ProxyUri  = "http://" + $ProxyHost + ":" + $ProxyPort
+
+$DiscordDownloadUrl = "https://discord.com/api/downloads/distributions/app/installers/latest?arch=x64&channel=stable&platform=win"
 
 $ReleaseApi = "https://api.github.com/repos/hdrover/discord-drover/releases/latest"
 $LocalDir   = Join-Path $env:LOCALAPPDATA "Pesherkino\DiscordDrover"
@@ -226,6 +228,198 @@ function Get-DiscordDirs {
     }
 
     return @($dirs)
+}
+
+function Test-OfficialDiscordDownloadUri {
+    param([uri]$Uri)
+
+    if (-not $Uri.IsAbsoluteUri -or $Uri.Scheme -ne "https" -or
+        $Uri.Port -ne 443 -or $Uri.UserInfo) { return $false }
+
+    foreach ($domain in @("discord.com", "discordapp.com", "discordapp.net")) {
+        if ($Uri.DnsSafeHost -ieq $domain -or
+            $Uri.DnsSafeHost.EndsWith("." + $domain, [StringComparison]::OrdinalIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Receive-DiscordInstaller {
+    param([string]$OutFile, [switch]$UseProxy)
+
+    # Validate every redirect; never follow an HTTP URL or a third-party mirror.
+    $uri = [uri]$DiscordDownloadUrl
+    $oldTls = [Net.ServicePointManager]::SecurityProtocol
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $oldTls -bor [Net.SecurityProtocolType]::Tls12
+        for ($hop = 0; $hop -lt 10; $hop++) {
+            if (-not (Test-OfficialDiscordDownloadUri -Uri $uri)) {
+                throw "Загрузка перенаправлена на неофициальный или небезопасный адрес: $uri"
+            }
+            $request = [Net.HttpWebRequest]::Create($uri)
+            $request.AllowAutoRedirect = $false
+            $request.Timeout = 30000
+            $request.ReadWriteTimeout = 30000
+            $request.UserAgent = "Pesherkino-Discord-Installer"
+            $request.Proxy = $null
+            if ($UseProxy) { $request.Proxy = New-Object Net.WebProxy($ProxyUri) }
+            $response = $null
+            $inputStream = $null
+            $outputStream = $null
+            try {
+                $response = $request.GetResponse()
+                $code = [int]$response.StatusCode
+                if ($code -in @(301,302,303,307,308)) {
+                    $location = $response.Headers["Location"]
+                    if (-not $location) { throw "Discord вернул перенаправление без адреса." }
+                    $uri = New-Object Uri($uri, $location)
+                    continue
+                }
+                if ($code -ne 200) { throw "Сервер загрузки Discord вернул HTTP $code." }
+                if ($response.ContentLength -gt 512MB) { throw "Установщик Discord слишком большой." }
+
+                $inputStream = $response.GetResponseStream()
+                $outputStream = [IO.File]::Create($OutFile)
+                $buffer = New-Object byte[] 65536
+                $total = 0L
+                while (($read = $inputStream.Read($buffer,0,$buffer.Length)) -gt 0) {
+                    $total += $read
+                    if ($total -gt 512MB -or $watch.Elapsed.TotalMinutes -ge 5) {
+                        throw "Превышен лимит размера или времени загрузки Discord."
+                    }
+                    $outputStream.Write($buffer,0,$read)
+                    $progress = @{ Activity = "Скачиваю Discord"; Status = ("{0:N1} МБ" -f ($total / 1MB)) }
+                    if ($response.ContentLength -gt 0) {
+                        $progress.PercentComplete = [int][Math]::Min(100, ($total * 100.0 / $response.ContentLength))
+                    }
+                    Write-Progress @progress
+                }
+                if ($total -eq 0 -or ($response.ContentLength -gt 0 -and $total -ne $response.ContentLength)) {
+                    throw "Установщик Discord скачан не полностью."
+                }
+                return
+            }
+            finally {
+                if ($outputStream) { $outputStream.Dispose() }
+                if ($inputStream) { $inputStream.Dispose() }
+                if ($response) { $response.Close() }
+            }
+        }
+        throw "Слишком много перенаправлений при загрузке Discord."
+    }
+    finally {
+        [Net.ServicePointManager]::SecurityProtocol = $oldTls
+        Write-Progress -Activity "Скачиваю Discord" -Completed
+    }
+}
+
+function Assert-DiscordInstallerSignature {
+    param([string]$Path)
+
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne "Valid" -or -not $signature.SignerCertificate) {
+        throw ("Цифровая подпись DiscordSetup.exe не прошла проверку: " + $signature.Status)
+    }
+    $publisher = $signature.SignerCertificate.GetNameInfo([Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+    if ($publisher -notmatch '^Discord,? Inc\.?$') {
+        throw "Установщик подписан неизвестным издателем: $publisher"
+    }
+    Write-C ("[OK] Действительная цифровая подпись: " + $publisher) Green
+}
+
+function Install-DiscordApplication {
+    # Only install Stable; existing PTB/Canary installations are left in place.
+    if (@(Get-DiscordDirs | Where-Object {
+        Test-Path -LiteralPath (Join-Path $_ "Discord.exe") -PathType Leaf
+    }).Count -gt 0) {
+        Write-C "[OK] Discord Stable уже установлен. Настраиваю подключение." Green
+        return $true
+    }
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or
+        -not [Environment]::Is64BitOperatingSystem) {
+        Write-C "[ERROR] Установка Discord поддерживается на 64-битной Windows." Red
+        return $false
+    }
+
+    $work = Join-Path ([IO.Path]::GetTempPath()) ("pesherkino-discord-" + [Guid]::NewGuid().ToString("N"))
+    $setupProcess = $null
+    $keepWork = $false
+    New-Item -ItemType Directory -Path $work -Force | Out-Null
+    try {
+        $setup = Join-Path $work "DiscordSetup.exe"
+        Write-C "[*] Скачиваю оригинальный Discord Stable через Pesherkino proxy..." Cyan
+        try {
+            Receive-DiscordInstaller -OutFile $setup -UseProxy
+        }
+        catch {
+            Write-C ("[!] Загрузка через proxy не удалась: " + $_.Exception.Message) Yellow
+            Write-C "[*] Пробую прямое подключение к официальным серверам Discord..." Cyan
+            Remove-Item -LiteralPath $setup -Force -ErrorAction SilentlyContinue
+            Receive-DiscordInstaller -OutFile $setup
+        }
+        Assert-DiscordInstallerSignature -Path $setup
+        Stop-Discord
+        Write-C "[*] Запускаю официальный установщик Discord. Дождитесь завершения." Cyan
+        $setupProcess = Start-Process -FilePath $setup -PassThru
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        while (-not $setupProcess.WaitForExit(1000)) {
+            if ($watch.Elapsed.TotalMinutes -ge 5) {
+                $keepWork = $true
+                throw "Установщик ещё работает. Завершите установку в его окне, затем выберите «Установить / обновить»."
+            }
+        }
+        if ($setupProcess.ExitCode -ne 0) {
+            throw ("Установщик Discord завершился с кодом " + $setupProcess.ExitCode + ". Лог: %LOCALAPPDATA%\SquirrelTemp\SquirrelSetup.log")
+        }
+        # Some installers delegate extraction to a child process.
+        $deadline = [DateTime]::UtcNow.AddSeconds(60)
+        do {
+            $stableDirs = @(Get-DiscordDirs | Where-Object {
+                Test-Path -LiteralPath (Join-Path $_ "Discord.exe") -PathType Leaf
+            })
+            if ($stableDirs.Count -gt 0) { break }
+            Start-Sleep -Seconds 1
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if ($stableDirs.Count -eq 0) { throw "Установщик завершился, но Discord.exe не найден. Проверьте окно и лог установки." }
+
+        Stop-Discord
+        Write-C "[OK] Discord Stable установлен. Далее устанавливаю Drover." Green
+        return $true
+    }
+    catch {
+        Write-C ("[ERROR] " + $_.Exception.Message) Red
+        Write-C "Прокси должен разрешать discord.com и CDN *.discordapp.net. Поддержка: @pesherkino_support" Yellow
+        return $false
+    }
+    finally {
+        if ($setupProcess -and -not $setupProcess.HasExited) { $keepWork = $true }
+        if (-not $keepWork) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Start-DiscordForLogin {
+    $dir = Get-DiscordDirs | Where-Object {
+        (Test-Path -LiteralPath (Join-Path $_ "Discord.exe") -PathType Leaf) -and
+        (Get-DroverState -Dir $_) -eq "Pesherkino"
+    } | Sort-Object { try { [version](Split-Path -Leaf $_).Substring(4) } catch { [version]"0.0" } } -Descending |
+        Select-Object -First 1
+    if (-not $dir) { throw "Discord Stable с настроенным Drover не найден." }
+    # Launch the patched executable directly for the first login.
+    Start-Process -FilePath (Join-Path $dir "Discord.exe") -WorkingDirectory $dir | Out-Null
+    Write-C "[OK] Discord запущен через Pesherkino proxy." Green
+    Write-C "Войдите в окне Discord: почта/пароль и 2FA либо QR-код с телефона." White
+}
+
+function Install-DiscordAndDrover {
+    Show-Header
+    if (Install-DiscordApplication) {
+        if (Deploy-Drover -Mode Install) {
+            try { Start-DiscordForLogin }
+            catch { Write-C ("[!] Не удалось открыть Discord: " + $_.Exception.Message + ". Запустите его вручную.") Yellow }
+        }
+    }
 }
 
 function Get-DroverState {
@@ -439,21 +633,28 @@ function Deploy-Drover {
 
     Show-Header
 
+    $newDiscord = $false
+    $dirs = @(Get-DiscordDirs)
+    if ($dirs.Count -eq 0 -and $Mode -eq "Install") {
+        Write-C "[*] Discord не найден. Сначала устанавливаю приложение." Cyan
+        if (-not (Install-DiscordApplication)) { return $false }
+        $newDiscord = $true
+        $dirs = @(Get-DiscordDirs)
+    }
+
     Write-C "[*] Проверяю реальное соединение через Pesherkino proxy..." Cyan
     if (-not (Test-PesherkinoProxy)) {
         Write-Host ""
         Write-C "Поддержка: @pesherkino_support" Yellow
-        return
+        return $false
     }
-
-    $dirs = @(Get-DiscordDirs)
 
     if ($dirs.Count -eq 0) {
         Write-Host ""
         Write-C "[ERROR] Discord Stable / PTB / Canary не найден." Red
         Write-C "Проверены стандартные пути, реестр Windows и Discord URI registration." DarkGray
-        Write-C "Сначала установи и хотя бы один раз запусти Discord." Yellow
-        return
+        Write-C "Выберите «Скачать и установить Discord» в меню." Yellow
+        return $false
     }
 
     Write-Host ""
@@ -518,10 +719,16 @@ function Deploy-Drover {
         Write-C ("[OK] Обработано папок Discord: " + $count) Green
         Write-Host ""
         Write-C "Теперь запусти Discord обычным способом." White
+        if ($newDiscord) {
+            try { Start-DiscordForLogin }
+            catch { Write-C ("[!] Не удалось открыть Discord: " + $_.Exception.Message + ". Запустите его вручную.") Yellow }
+        }
+        return $true
     }
     catch {
         Write-Host ""
         Write-C ("[ERROR] " + $_.Exception.Message) Red
+        return $false
     }
     finally {
         Remove-Item -Path $work -Recurse -Force -ErrorAction SilentlyContinue
@@ -760,6 +967,7 @@ function Draw-MainMenu {
     $w = 64
     $items = @(
         "Установить / обновить",
+        "Скачать и установить Discord",
         "Repair / переустановить Drover",
         "Статус и диагностика",
         "Удалить Pesherkino Discord",
@@ -814,14 +1022,16 @@ function Show-FallbackMenu {
         Write-C "2. Repair / переустановить Drover" White
         Write-C "3. Статус и диагностика" White
         Write-C "4. Удалить Pesherkino Discord" White
+        Write-C "5. Скачать и установить Discord" White
         Write-C "0. Выход" DarkGray
         Write-Host ""
 
         switch (Read-Host "Выберите действие") {
-            "1" { Deploy-Drover -Mode Install; Read-Host "Enter для продолжения" | Out-Null }
-            "2" { Deploy-Drover -Mode Repair; Read-Host "Enter для продолжения" | Out-Null }
+            "1" { Deploy-Drover -Mode Install | Out-Null; Read-Host "Enter для продолжения" | Out-Null }
+            "2" { Deploy-Drover -Mode Repair | Out-Null; Read-Host "Enter для продолжения" | Out-Null }
             "3" { Show-Status; Read-Host "Enter для продолжения" | Out-Null }
             "4" { Uninstall-PesherkinoDiscord; Read-Host "Enter для продолжения" | Out-Null }
+            "5" { Install-DiscordAndDrover; Read-Host "Enter для продолжения" | Out-Null }
             "0" { return }
         }
     }
@@ -856,22 +1066,22 @@ function Show-Menu {
             switch ($key.Key) {
                 "UpArrow" {
                     $selected--
-                    if ($selected -lt 0) { $selected = 4 }
+                    if ($selected -lt 0) { $selected = 5 }
                 }
 
                 "DownArrow" {
                     $selected++
-                    if ($selected -gt 4) { $selected = 0 }
+                    if ($selected -gt 5) { $selected = 0 }
                 }
 
                 "W" {
                     $selected--
-                    if ($selected -lt 0) { $selected = 4 }
+                    if ($selected -lt 0) { $selected = 5 }
                 }
 
                 "S" {
                     $selected++
-                    if ($selected -gt 4) { $selected = 0 }
+                    if ($selected -gt 5) { $selected = 0 }
                 }
 
                 "Escape" {
@@ -885,18 +1095,20 @@ function Show-Menu {
         }
 
         switch ($selected) {
-            0 { Deploy-Drover -Mode Install; Wait-TuiKey }
-            1 { Deploy-Drover -Mode Repair; Wait-TuiKey }
-            2 { Show-Status; Wait-TuiKey }
-            3 { Uninstall-PesherkinoDiscord; Wait-TuiKey }
-            4 { return }
+            0 { Deploy-Drover -Mode Install | Out-Null; Wait-TuiKey }
+            1 { Install-DiscordAndDrover; Wait-TuiKey }
+            2 { Deploy-Drover -Mode Repair | Out-Null; Wait-TuiKey }
+            3 { Show-Status; Wait-TuiKey }
+            4 { Uninstall-PesherkinoDiscord; Wait-TuiKey }
+            5 { return }
         }
     }
 }
 
 switch ($Action) {
-    "Install"   { Deploy-Drover -Mode Install }
-    "Repair"    { Deploy-Drover -Mode Repair }
+    "Install"   { Deploy-Drover -Mode Install | Out-Null }
+    "InstallDiscord" { Install-DiscordAndDrover }
+    "Repair"    { Deploy-Drover -Mode Repair | Out-Null }
     "Uninstall" { Uninstall-PesherkinoDiscord }
     "Status"    { Show-Status }
     default     { Show-Menu }
