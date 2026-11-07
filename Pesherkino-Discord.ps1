@@ -30,6 +30,11 @@ try {
 try { $Host.UI.RawUI.WindowTitle = "Pesherkino Discord" } catch {}
 
 $ProxyHosts = @("dearly.netherus.com","nl.netherus.com")
+# Домены, которые должен разрешать и пропускать каждый прокси.
+# Добавляйте новые имена в этот список, например: "cdn.discordapp.com", "media.discordapp.net".
+$ProxyCheckDomains = @(
+    "discord.com"
+)
 $ProxyPort = 5555
 $ProxyHost = $ProxyHosts[0]
 $ProxyUri  = "http://" + $ProxyHost + ":" + $ProxyPort
@@ -1030,26 +1035,66 @@ function Get-ActiveDiscordDirs {
     }
 }
 
+function Test-ProxyCheckDomainName {
+    param([string]$Domain)
+    if ([string]::IsNullOrWhiteSpace($Domain)) { return $false }
+    $value = $Domain.Trim().TrimEnd('.')
+    if ($value.Length -gt 253) { return $false }
+    return ($value -match '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$')
+}
+
 function Get-ProxySnapshot {
     param([switch]$Refresh)
     if (-not $Refresh -and $script:ProxySnapshot -and
         ([DateTime]::UtcNow - $script:ProxySnapshot.CheckedAt).TotalSeconds -lt 30) {
         return $script:ProxySnapshot
     }
+    $domains = @($ProxyCheckDomains | ForEach-Object {
+        if (-not [string]::IsNullOrWhiteSpace([string]$_)) { ([string]$_).Trim().TrimEnd('.') }
+    } | Select-Object -Unique)
     $candidates = @()
     foreach ($candidateHost in $ProxyHosts) {
         $watch = [Diagnostics.Stopwatch]::StartNew()
-        $discord = Test-ProxyConnect -TargetHost "discord.com" -ProxyServer $candidateHost
+        $domainChecks = @()
+        foreach ($domain in $domains) {
+            if (-not (Test-ProxyCheckDomainName -Domain $domain)) {
+                $domainChecks += [pscustomobject]@{
+                    Domain = $domain; Success = $false; StatusCode = 0
+                    StatusLine = "Некорректное доменное имя в ProxyCheckDomains"
+                }
+                continue
+            }
+            $check = Test-ProxyConnect -TargetHost $domain -ProxyServer $candidateHost
+            $domainChecks += [pscustomobject]@{
+                Domain = $domain; Success = [bool]$check.Success
+                StatusCode = $check.StatusCode; StatusLine = $check.StatusLine
+            }
+        }
+        $domainsPassed = ($domainChecks.Count -gt 0 -and @($domainChecks | Where-Object { -not $_.Success }).Count -eq 0)
         $api = $null
         $blocked = $null
-        if ($discord.Success) {
+        if ($domainsPassed) {
             $api = Test-ProxyDiscordApi -ProxyServer $candidateHost
             if ($api.Success) {
                 $blocked = Test-ProxyConnect -TargetHost "example.com" -ProxyServer $candidateHost
             }
         }
-        $valid = ($discord.Success -and $api -and $api.Success -and $blocked -and $blocked.StatusCode -eq 403)
-        if (-not $discord.Success) { $detail = $discord.StatusLine }
+        $valid = ($domainsPassed -and $api -and $api.Success -and $blocked -and $blocked.StatusCode -eq 403)
+        $primaryDomain = $domainChecks | Where-Object { $_.Domain -ieq "discord.com" } | Select-Object -First 1
+        if (-not $primaryDomain) { $primaryDomain = $domainChecks | Select-Object -First 1 }
+        $discord = if ($primaryDomain) {
+            [pscustomobject]@{
+                Success = [bool]$primaryDomain.Success
+                StatusCode = $primaryDomain.StatusCode
+                StatusLine = $primaryDomain.StatusLine
+            }
+        } else {
+            [pscustomobject]@{ Success = $false; StatusCode = 0; StatusLine = "Список ProxyCheckDomains пуст" }
+        }
+        if (-not $domainsPassed) {
+            $failedDomain = $domainChecks | Where-Object { -not $_.Success } | Select-Object -First 1
+            $detail = if ($failedDomain) { $failedDomain.Domain + ": " + $failedDomain.StatusLine } else { "Список ProxyCheckDomains пуст" }
+        }
         elseif (-not $api.Success) { $detail = $api.StatusLine }
         elseif (-not $blocked -or $blocked.StatusCode -ne 403) { $detail = "Фильтр example.com не подтвердил HTTP 403" }
         else { $detail = "Все проверки пройдены" }
@@ -1059,6 +1104,7 @@ function Get-ProxySnapshot {
             Uri = "http://" + $candidateHost + ":" + $ProxyPort
             Success = [bool]$valid
             Discord = $discord
+            DomainChecks = $domainChecks
             Api = $api
             Blocked = $blocked
             LatencyMs = [int]$watch.ElapsedMilliseconds
@@ -1077,7 +1123,7 @@ function Get-ProxySnapshot {
     else {
         $script:ProxyHost = $ProxyHosts[0]
         $script:ProxyUri = "http://" + $script:ProxyHost + ":" + $ProxyPort
-        $state = "Оба прокси недоступны"
+        $state = "Нет подходящего прокси"
         $color = [ConsoleColor]::Red
         $first = $candidates | Select-Object -First 1
         $discordResult = if ($first) { $first.Discord } else { $null }
@@ -1090,6 +1136,7 @@ function Get-ProxySnapshot {
         SelectedHost = if ($selected) { $selected.Host } else { $null }
         SelectedLatencyMs = if ($selected) { $selected.LatencyMs } else { 0 }
         Discord = $discordResult
+        DomainChecks = if ($selected) { $selected.DomainChecks } elseif ($first) { $first.DomainChecks } else { @() }
         Blocked = $blockedResult
         State = $state
         Color = $color
