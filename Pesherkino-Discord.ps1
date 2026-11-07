@@ -29,14 +29,13 @@ try {
 } catch {}
 try { $Host.UI.RawUI.WindowTitle = "Pesherkino Discord" } catch {}
 
-$ProxyHosts = @("dearly.netherus.com","nl.netherus.com")
-# Домены, которые должен разрешать и пропускать каждый прокси.
-# Добавляйте новые имена в этот список, например: "cdn.discordapp.com", "media.discordapp.net".
-$ProxyCheckDomains = @(
-    "discord.com"
+# Список адресов самих прокси-серверов. Добавляйте новые серверы сюда.
+$ProxyServers = @(
+    "dearly.netherus.com",
+    "nl.netherus.com"
 )
 $ProxyPort = 5555
-$ProxyHost = $ProxyHosts[0]
+$ProxyHost = $ProxyServers[0]
 $ProxyUri  = "http://" + $ProxyHost + ":" + $ProxyPort
 
 $DiscordDownloadUrl = "https://discord.com/api/downloads/distributions/app/installers/latest?arch=x64&channel=stable&platform=win"
@@ -1035,67 +1034,27 @@ function Get-ActiveDiscordDirs {
     }
 }
 
-function Test-ProxyCheckDomainName {
-    param([string]$Domain)
-    if ([string]::IsNullOrWhiteSpace($Domain)) { return $false }
-    $value = $Domain.Trim().TrimEnd('.')
-    if ($value.Length -gt 253) { return $false }
-    return ($value -match '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$')
-}
-
 function Get-ProxySnapshot {
     param([switch]$Refresh)
     if (-not $Refresh -and $script:ProxySnapshot -and
         ([DateTime]::UtcNow - $script:ProxySnapshot.CheckedAt).TotalSeconds -lt 30) {
         return $script:ProxySnapshot
     }
-    $domains = @($ProxyCheckDomains | ForEach-Object {
-        if (-not [string]::IsNullOrWhiteSpace([string]$_)) { ([string]$_).Trim().TrimEnd('.') }
-    } | Select-Object -Unique)
     $candidates = @()
-    foreach ($candidateHost in $ProxyHosts) {
+    foreach ($candidateHost in $ProxyServers) {
         $watch = [Diagnostics.Stopwatch]::StartNew()
-        $domainChecks = @()
-        foreach ($domain in $domains) {
-            if (-not (Test-ProxyCheckDomainName -Domain $domain)) {
-                $domainChecks += [pscustomobject]@{
-                    Domain = $domain; Success = $false; StatusCode = 0
-                    StatusLine = "Некорректное доменное имя в ProxyCheckDomains"
-                }
-                continue
-            }
-            $check = Test-ProxyConnect -TargetHost $domain -ProxyServer $candidateHost
-            $domainChecks += [pscustomobject]@{
-                Domain = $domain; Success = [bool]$check.Success
-                StatusCode = $check.StatusCode; StatusLine = $check.StatusLine
-            }
-        }
-        $domainsPassed = ($domainChecks.Count -gt 0 -and @($domainChecks | Where-Object { -not $_.Success }).Count -eq 0)
+        $discord = Test-ProxyConnect -TargetHost "discord.com" -ProxyServer $candidateHost
         $api = $null
         $blocked = $null
-        if ($domainsPassed) {
+        if ($discord.Success) {
             $api = Test-ProxyDiscordApi -ProxyServer $candidateHost
             if ($api.Success) {
                 $blocked = Test-ProxyConnect -TargetHost "example.com" -ProxyServer $candidateHost
             }
         }
-        $valid = ($domainsPassed -and $api -and $api.Success -and $blocked -and $blocked.StatusCode -eq 403)
-        $primaryDomain = $domainChecks | Where-Object { $_.Domain -ieq "discord.com" } | Select-Object -First 1
-        if (-not $primaryDomain) { $primaryDomain = $domainChecks | Select-Object -First 1 }
-        $discord = if ($primaryDomain) {
-            [pscustomobject]@{
-                Success = [bool]$primaryDomain.Success
-                StatusCode = $primaryDomain.StatusCode
-                StatusLine = $primaryDomain.StatusLine
-            }
-        } else {
-            [pscustomobject]@{ Success = $false; StatusCode = 0; StatusLine = "Список ProxyCheckDomains пуст" }
-        }
-        if (-not $domainsPassed) {
-            $failedDomain = $domainChecks | Where-Object { -not $_.Success } | Select-Object -First 1
-            $detail = if ($failedDomain) { $failedDomain.Domain + ": " + $failedDomain.StatusLine } else { "Список ProxyCheckDomains пуст" }
-        }
-        elseif (-not $api.Success) { $detail = $api.StatusLine }
+        $valid = ($discord.Success -and $api -and $api.Success -and $blocked -and $blocked.StatusCode -eq 403)
+        if (-not $discord.Success) { $detail = $discord.StatusLine }
+        elseif (-not $api -or -not $api.Success) { $detail = if ($api) { $api.StatusLine } else { "Discord API не проверен" } }
         elseif (-not $blocked -or $blocked.StatusCode -ne 403) { $detail = "Фильтр example.com не подтвердил HTTP 403" }
         else { $detail = "Все проверки пройдены" }
         $watch.Stop()
@@ -1104,7 +1063,6 @@ function Get-ProxySnapshot {
             Uri = "http://" + $candidateHost + ":" + $ProxyPort
             Success = [bool]$valid
             Discord = $discord
-            DomainChecks = $domainChecks
             Api = $api
             Blocked = $blocked
             LatencyMs = [int]$watch.ElapsedMilliseconds
@@ -1122,7 +1080,7 @@ function Get-ProxySnapshot {
         $blockedResult = $selected.Blocked
     }
     else {
-        $script:ProxyHost = $ProxyHosts[0]
+        $script:ProxyHost = $ProxyServers[0]
         $script:ProxyUri = "http://" + $script:ProxyHost + ":" + $ProxyPort
         $state = "Нет подходящего прокси"
         $color = [ConsoleColor]::Red
@@ -1136,7 +1094,6 @@ function Get-ProxySnapshot {
         SelectedHost = if ($selected) { $selected.Host } else { $null }
         SelectedLatencyMs = if ($selected) { $selected.LatencyMs } else { 0 }
         Discord = $discordResult
-        DomainChecks = if ($selected) { $selected.DomainChecks } elseif ($first) { $first.DomainChecks } else { @() }
         Blocked = $blockedResult
         State = $state
         Color = $color
@@ -1205,25 +1162,13 @@ function Show-Status {
     $gateway = Test-ProxyConnect -TargetHost "gateway.discord.gg"
     $api = Test-DiscordWebRequest -Uri "https://discord.com/api/v10/gateway"
     $download = Test-DiscordWebRequest -Uri $DiscordDownloadUrl -Method Head
-    $diagnostics = New-Object System.Collections.Generic.List[object]
-    foreach ($domainCheck in @($network.DomainChecks)) {
-        $diagnostics.Add([pscustomobject]@{
-            Name = "Прокси → " + $domainCheck.Domain
-            Good = [bool]$domainCheck.Success
-            Code = $domainCheck.StatusCode
-            Detail = $domainCheck.StatusLine
-        })
-    }
-    $diagnostics.Add([pscustomobject]@{
-        Name = "Посторонние сайты запрещены"
-        Good = ($network.Blocked -and $network.Blocked.StatusCode -eq 403)
-        Code = if ($network.Blocked) { $network.Blocked.StatusCode } else { 0 }
-        Detail = if ($network.Blocked) { $network.Blocked.StatusLine } else { "Не проверено: прокси недоступен" }
-    })
-    $diagnostics.Add([pscustomobject]@{ Name = "Gateway · CONNECT"; Good = $gateway.Success; Code = $gateway.StatusCode; Detail = $gateway.StatusLine })
-    $diagnostics.Add([pscustomobject]@{ Name = "API Discord · HTTPS"; Good = $api.Success; Code = $api.StatusCode; Detail = $api.Detail })
-    $diagnostics.Add([pscustomobject]@{ Name = "Установщик · HTTPS и CDN"; Good = $download.Success; Code = $download.StatusCode; Detail = $download.Detail })
-    $script:LastDiagnostic = @($diagnostics.ToArray())
+    $script:LastDiagnostic = @(
+        [pscustomobject]@{ Name = "Прокси → discord.com"; Good = $network.Discord.Success; Code = $network.Discord.StatusCode; Detail = $network.Discord.StatusLine },
+        [pscustomobject]@{ Name = "Посторонние сайты запрещены"; Good = ($network.Blocked -and $network.Blocked.StatusCode -eq 403); Code = if ($network.Blocked) { $network.Blocked.StatusCode } else { 0 }; Detail = if ($network.Blocked) { $network.Blocked.StatusLine } else { "Не проверено: прокси недоступен" } },
+        [pscustomobject]@{ Name = "Gateway · CONNECT"; Good = $gateway.Success; Code = $gateway.StatusCode; Detail = $gateway.StatusLine },
+        [pscustomobject]@{ Name = "API Discord · HTTPS"; Good = $api.Success; Code = $api.StatusCode; Detail = $api.Detail },
+        [pscustomobject]@{ Name = "Установщик · HTTPS и CDN"; Good = $download.Success; Code = $download.StatusCode; Detail = $download.Detail }
+    )
     Write-Host ""
     foreach ($check in $script:LastDiagnostic) {
         $mark = if ($check.Good) { "[OK]" } else { "[!]" }
@@ -1236,7 +1181,7 @@ function Show-Status {
     Write-C ("Подключение: " + $snapshot.DroverState) $snapshot.DroverColor
     Write-C "Проверка Gateway подтверждает CONNECT, вход и голос проверяются в приложении." Gray
     if (@($script:LastDiagnostic | Where-Object { -not $_.Good }).Count -gt 0) {
-        Write-C "Что сделать: проверьте интернет, доступ к прокси и список разрешённых доменов." Yellow
+        Write-C "Что сделать: проверьте интернет, доступ к прокси и его список разрешённых доменов." Yellow
         Write-C "Для поддержки выберите «Сохранить отчёт»." Yellow
     }
 }
