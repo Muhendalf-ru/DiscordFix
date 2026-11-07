@@ -616,7 +616,7 @@ function Get-DroverState {
     if ($hasIni) {
         try {
             $text = Get-Content -LiteralPath $ini -Raw -ErrorAction Stop
-            foreach ($knownProxy in $ProxyHosts) {
+            foreach ($knownProxy in $ProxyServers) {
                 if ($text -match [regex]::Escape($knownProxy)) {
                     if ($hasDll) { return "Pesherkino" }
                     return "PesherkinoPartial"
@@ -997,7 +997,7 @@ function Uninstall-PesherkinoDiscord {
         if (Test-Path $iniPath) {
             try {
                 $text = Get-Content -LiteralPath $iniPath -Raw
-                foreach ($knownProxy in $ProxyHosts) {
+                foreach ($knownProxy in $ProxyServers) {
                     if ($text -match [regex]::Escape($knownProxy)) { $isOurs = $true; break }
                 }
             }
