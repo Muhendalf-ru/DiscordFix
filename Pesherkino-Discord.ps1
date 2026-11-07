@@ -29,8 +29,9 @@ try {
 } catch {}
 try { $Host.UI.RawUI.WindowTitle = "Pesherkino Discord" } catch {}
 
-$ProxyHost = "dearly.netherus.com"
+$ProxyHosts = @("dearly.netherus.com","nl.netherus.com")
 $ProxyPort = 5555
+$ProxyHost = $ProxyHosts[0]
 $ProxyUri  = "http://" + $ProxyHost + ":" + $ProxyPort
 
 $DiscordDownloadUrl = "https://discord.com/api/downloads/distributions/app/installers/latest?arch=x64&channel=stable&platform=win"
@@ -39,6 +40,7 @@ $ReleaseApi = "https://api.github.com/repos/hdrover/discord-drover/releases/late
 $LocalDir   = Join-Path $env:LOCALAPPDATA "Pesherkino\DiscordDrover"
 $script:SessionEvents = New-Object System.Collections.Generic.List[string]
 $script:ProxySnapshot = $null
+$script:ProxyCandidates = @()
 $script:LastDiagnostic = @()
 $script:UseAnsi = $false
 $script:MenuLayout = $null
@@ -498,6 +500,11 @@ function Install-DiscordApplication {
     try {
         $setup = Join-Path $work "DiscordSetup.exe"
         Write-InstallStage 1 7 "Скачивание Discord"
+        $proxyCheck = Get-ProxySnapshot -Refresh
+        if ($proxyCheck.SelectedHost) {
+            Write-C ("[*] Выбран прокси " + $proxyCheck.SelectedHost + ":" + $ProxyPort + " (" + $proxyCheck.SelectedLatencyMs + " мс).") Cyan
+        }
+        else { Write-C "[!] Оба прокси недоступны для Discord. Попробую прямую загрузку официального установщика." Yellow }
         Write-C "[*] Скачиваю оригинальный Discord Stable через Pesherkino proxy..." Cyan
         try {
             Receive-DiscordInstaller -OutFile $setup -UseProxy
@@ -550,9 +557,33 @@ function Install-DiscordApplication {
 }
 
 function Start-DiscordForLogin {
+    $network = Get-ProxySnapshot -Refresh
+    if (-not $network.SelectedHost) { throw "Оба прокси недоступны. Discord не запущен." }
     $candidates = @()
     foreach ($dir in @(Get-ActiveDiscordDirs)) {
         if ((Get-DroverState -Dir $dir) -ne "Pesherkino") { continue }
+        $iniPath = Join-Path $dir "drover.ini"
+        $iniText = [IO.File]::ReadAllText($iniPath)
+        $proxyLine = "proxy = " + $ProxyUri
+        if ($iniText -match '(?im)^\s*proxy\s*=') {
+            $iniText = [regex]::Replace($iniText,'(?im)^\s*proxy\s*=.*
+            $path = Join-Path $dir $exe
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $candidates += [pscustomobject]@{ Directory = $dir; Path = $path; Stable = ($exe -eq "Discord.exe") }
+                break
+            }
+        }
+    }
+    $target = $candidates | Sort-Object Stable -Descending | Select-Object -First 1
+    if (-not $target) { throw "Актуальная версия Discord с настроенным подключением не найдена. Выберите «Восстановить подключение»." }
+    # Launch the patched executable directly for the first login.
+    Start-Process -FilePath $target.Path -WorkingDirectory $target.Directory | Out-Null
+    Write-C ("[OK] Discord запущен через " + $ProxyHost + ":" + $ProxyPort + ".") Green
+    Write-C "Войдите в окне Discord: почта/пароль и 2FA либо QR-код с телефона." White
+}
+, $proxyLine)
+        }
+        [IO.File]::WriteAllText($iniPath,$iniText,[Text.Encoding]::ASCII)
         foreach ($exe in @("Discord.exe","DiscordPTB.exe","DiscordCanary.exe")) {
             $path = Join-Path $dir $exe
             if (Test-Path -LiteralPath $path -PathType Leaf) {
@@ -597,9 +628,11 @@ function Get-DroverState {
     if ($hasIni) {
         try {
             $text = Get-Content -LiteralPath $ini -Raw -ErrorAction Stop
-            if ($text -match [regex]::Escape($ProxyHost)) {
-                if ($hasDll) { return "Pesherkino" }
-                return "PesherkinoPartial"
+            foreach ($knownProxy in $ProxyHosts) {
+                if ($text -match [regex]::Escape($knownProxy)) {
+                    if ($hasDll) { return "Pesherkino" }
+                    return "PesherkinoPartial"
+                }
             }
         }
         catch {}
@@ -629,7 +662,8 @@ function Stop-Discord {
 function Test-ProxyConnect {
     param(
         [Parameter(Mandatory=$true)][string]$TargetHost,
-        [int]$TargetPort = 443
+        [int]$TargetPort = 443,
+        [string]$ProxyServer
     )
 
     $client = $null
@@ -637,7 +671,8 @@ function Test-ProxyConnect {
 
     try {
         $client = New-Object System.Net.Sockets.TcpClient
-        $async = $client.BeginConnect($ProxyHost,$ProxyPort,$null,$null)
+        if ([string]::IsNullOrWhiteSpace($ProxyServer)) { $ProxyServer = $script:ProxyHost }
+        $async = $client.BeginConnect($ProxyServer,$ProxyPort,$null,$null)
 
         if (-not $async.AsyncWaitHandle.WaitOne(5000,$false)) {
             $client.Close()
@@ -688,6 +723,52 @@ function Test-ProxyConnect {
     finally {
         if ($reader) { try { $reader.Dispose() } catch {} }
         if ($client) { try { $client.Close() } catch {} }
+    }
+}
+
+function Test-ProxyDiscordApi {
+    param([Parameter(Mandatory=$true)][string]$ProxyServer)
+    $oldTls = [Net.ServicePointManager]::SecurityProtocol
+    $response = $null
+    $reader = $null
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    $statusCode = 0
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $oldTls -bor [Net.SecurityProtocolType]::Tls12
+        $request = [Net.HttpWebRequest]::Create("https://discord.com/api/v10/gateway")
+        $proxyAddress = "http://" + $ProxyServer + ":" + $ProxyPort
+        $request.Proxy = New-Object Net.WebProxy($proxyAddress)
+        $request.Method = "GET"
+        $request.UserAgent = "Pesherkino-Discord-Installer"
+        $request.Timeout = 10000
+        $request.ReadWriteTimeout = 10000
+        $request.AllowAutoRedirect = $false
+        $response = $request.GetResponse()
+        $statusCode = [int]$response.StatusCode
+        $reader = New-Object IO.StreamReader($response.GetResponseStream())
+        $payload = $reader.ReadToEnd() | ConvertFrom-Json
+        $success = ($statusCode -eq 200 -and [string]$payload.url -match '^wss://gateway\.discord\.gg')
+        return [pscustomobject]@{
+            Success = $success
+            StatusCode = $statusCode
+            StatusLine = if ($success) { "Discord API HTTP 200" } else { "Unexpected Discord API response" }
+            ElapsedMs = [int]$watch.ElapsedMilliseconds
+        }
+    }
+    catch {
+        try { $statusCode = [int]$_.Exception.Response.StatusCode } catch {}
+        return [pscustomobject]@{
+            Success = $false
+            StatusCode = $statusCode
+            StatusLine = (Protect-ReportText $_.Exception.Message)
+            ElapsedMs = [int]$watch.ElapsedMilliseconds
+        }
+    }
+    finally {
+        if ($reader) { try { $reader.Dispose() } catch {} }
+        if ($response) { try { $response.Close() } catch {} }
+        [Net.ServicePointManager]::SecurityProtocol = $oldTls
+        $watch.Stop()
     }
 }
 
@@ -928,7 +1009,9 @@ function Uninstall-PesherkinoDiscord {
         if (Test-Path $iniPath) {
             try {
                 $text = Get-Content -LiteralPath $iniPath -Raw
-                if ($text -match [regex]::Escape($ProxyHost)) { $isOurs = $true }
+                foreach ($knownProxy in $ProxyHosts) {
+                    if ($text -match [regex]::Escape($knownProxy)) { $isOurs = $true; break }
+                }
             }
             catch {}
         }
@@ -969,22 +1052,66 @@ function Get-ProxySnapshot {
         ([DateTime]::UtcNow - $script:ProxySnapshot.CheckedAt).TotalSeconds -lt 30) {
         return $script:ProxySnapshot
     }
-    $discord = Test-ProxyConnect -TargetHost "discord.com"
-    $blocked = $null
-    $state = "Недоступен"
-    $color = [ConsoleColor]::Red
-    if ($discord.Success) {
-        $blocked = Test-ProxyConnect -TargetHost "example.com"
-        if ($blocked.StatusCode -eq 403) { $state = "Доступен · CONNECT"; $color = [ConsoleColor]::Green }
-        elseif ($blocked.Success) { $state = "Посторонние сайты разрешены"; $color = [ConsoleColor]::Yellow }
-        else { $state = "Фильтр не удалось проверить"; $color = [ConsoleColor]::Yellow }
+    $candidates = @()
+    foreach ($candidateHost in $ProxyHosts) {
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $discord = Test-ProxyConnect -TargetHost "discord.com" -ProxyServer $candidateHost
+        $api = $null
+        $blocked = $null
+        if ($discord.Success) {
+            $api = Test-ProxyDiscordApi -ProxyServer $candidateHost
+            if ($api.Success) {
+                $blocked = Test-ProxyConnect -TargetHost "example.com" -ProxyServer $candidateHost
+            }
+        }
+        $valid = ($discord.Success -and $api -and $api.Success -and $blocked -and $blocked.StatusCode -eq 403)
+        if (-not $discord.Success) { $detail = $discord.StatusLine }
+        elseif (-not $api.Success) { $detail = $api.StatusLine }
+        elseif (-not $blocked -or $blocked.StatusCode -ne 403) { $detail = "Фильтр example.com не подтвердил HTTP 403" }
+        else { $detail = "Все проверки пройдены" }
+        $watch.Stop()
+        $candidates += [pscustomobject]@{
+            Host = $candidateHost
+            Uri = "http://" + $candidateHost + ":" + $ProxyPort
+            Success = [bool]$valid
+            Discord = $discord
+            Api = $api
+            Blocked = $blocked
+            LatencyMs = [int]$watch.ElapsedMilliseconds
+            Detail = $detail
+        }
     }
+    $selected = $candidates | Where-Object { $_.Success } | Sort-Object LatencyMs | Select-Object -First 1
+    if ($selected) {
+        $script:ProxyHost = $selected.Host
+        $script:ProxyUri = $selected.Uri
+        $state = "Работает · " + $selected.Host + " · " + $selected.LatencyMs + " мс"
+        $color = [ConsoleColor]::Green
+        $discordResult = $selected.Discord
+        $blockedResult = $selected.Blocked
+    }
+    else {
+        $script:ProxyHost = $ProxyHosts[0]
+        $script:ProxyUri = "http://" + $script:ProxyHost + ":" + $ProxyPort
+        $state = "Оба прокси недоступны"
+        $color = [ConsoleColor]::Red
+        $first = $candidates | Select-Object -First 1
+        $discordResult = if ($first) { $first.Discord } else { $null }
+        $blockedResult = if ($first) { $first.Blocked } else { $null }
+    }
+    $script:ProxyCandidates = $candidates
     $script:ProxySnapshot = [pscustomobject]@{
-        CheckedAt = [DateTime]::UtcNow; Discord = $discord; Blocked = $blocked; State = $state; Color = $color
+        CheckedAt = [DateTime]::UtcNow
+        Candidates = $candidates
+        SelectedHost = if ($selected) { $selected.Host } else { $null }
+        SelectedLatencyMs = if ($selected) { $selected.LatencyMs } else { 0 }
+        Discord = $discordResult
+        Blocked = $blockedResult
+        State = $state
+        Color = $color
     }
     return $script:ProxySnapshot
 }
-
 function Get-MenuSnapshot {
     param([switch]$RefreshNetwork, [switch]$SkipNetwork)
     $dirs = @(Get-ActiveDiscordDirs)
