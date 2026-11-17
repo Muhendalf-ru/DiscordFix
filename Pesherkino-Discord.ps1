@@ -32,7 +32,8 @@ try { $Host.UI.RawUI.WindowTitle = "Pesherkino Discord" } catch {}
 # Список адресов самих прокси-серверов. Добавляйте новые серверы сюда.
 $ProxyServers = @(
     "dearly.netherus.com",
-    "nl.netherus.com"
+    "nl.netherus.com",
+    "brother.netherus.com"
 )
 $ProxyPort = 5555
 $ProxyHost = $ProxyServers[0]
