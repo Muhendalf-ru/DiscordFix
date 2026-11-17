@@ -33,7 +33,7 @@ try { $Host.UI.RawUI.WindowTitle = "Pesherkino Discord" } catch {}
 $ProxyServers = @(
     "dearly.netherus.com",
     "nl.netherus.com",
-    "brother.netherus.com"
+    "theboy.netherus.com"
 )
 $ProxyPort = 5555
 $ProxyHost = $ProxyServers[0]
